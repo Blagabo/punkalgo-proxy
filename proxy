@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Lanzador del proxy. Usa el virtualenv si existe; si no, el python3 del sistema.
+set -e
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -x "$HERE/.venv/bin/python" ]; then
+    PY="$HERE/.venv/bin/python"
+else
+    PY="python3"
+fi
+exec "$PY" "$HERE/proxy.py" "$@"

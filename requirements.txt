@@ -1,0 +1,6 @@
+# Dependencias del proxy.
+# El script arranca sólo con `requests` (usa el servidor HTTP de la librería
+# estándar). Flask + waitress son la forma recomendada de correr el webhook.
+requests>=2.31
+flask>=3.0
+waitress>=3.0
