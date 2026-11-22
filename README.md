@@ -251,3 +251,11 @@ quedar plano no signifique perder comisiones: con entrada 0.00883 y 0.1 % el SL 
 * En `TP_MODE=partials`, si la cantidad no da para partir el tamaño en N partes sobre el
   mínimo del contrato, se coloca un único TP con toda la cantidad en el Objetivo 1.
 * El tamaño se calcula con el equity del momento de la señal.
+
+## Licencia
+
+MIT — ver [LICENSE](LICENSE).
+
+Software de trading con dinero real: úsalo bajo tu propia responsabilidad. Prueba primero
+con `DRY_RUN=true`, arranca con `MAX_LEVERAGE` y `POSITION_SIZE_PCT` bajos, y usa una cuenta
+dedicada con una API key sin permiso de retiro.
