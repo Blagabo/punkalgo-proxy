@@ -177,6 +177,16 @@ class Config:
     dry_run_sim: bool = True             # en dry-run, simula fill/TP/BE/cierre sin llamar al exchange
     dry_run_phase_sec: float = 18.0      # segundos de cada fase simulada (entrada, TP1, TP2…)
 
+    # --- Broker / paper trading --------------------------------------------------------
+    broker: str = "bitunix"              # bitunix | paper (precios reales, órdenes simuladas)
+    risk_pct: float = 0.5                # sizing_mode=risk: % del equity que se pierde si salta el SL
+    paper_equity: float = 1000.0
+    paper_taker_fee_pct: float = 0.06
+    paper_maker_fee_pct: float = 0.02
+    paper_slippage_pct: float = 0.02     # en contra, en entradas a mercado, SL y TP
+    paper_state_file: str = "paper_state.json"
+    paper_journal_file: str = "paper_trades.jsonl"
+
 
 CFG = Config(
     api_key=s("BITUNIX_API_KEY", ""),
@@ -226,9 +236,19 @@ CFG = Config(
     dry_run_equity=f("DRY_RUN_EQUITY", 1000.0),
     dry_run_sim=b("DRY_RUN_SIM", True),
     dry_run_phase_sec=f("DRY_RUN_PHASE_SEC", 18.0),
+    broker=s("BROKER", "bitunix").lower(),
+    risk_pct=f("RISK_PCT", 0.5),
+    paper_equity=f("PAPER_EQUITY", 1000.0),
+    paper_taker_fee_pct=f("PAPER_TAKER_FEE_PCT", 0.06),
+    paper_maker_fee_pct=f("PAPER_MAKER_FEE_PCT", 0.02),
+    paper_slippage_pct=f("PAPER_SLIPPAGE_PCT", 0.02),
+    paper_state_file=s("PAPER_STATE_FILE", "paper_state.json"),
+    paper_journal_file=s("PAPER_JOURNAL_FILE", "paper_trades.jsonl"),
 )
 
-if CFG.sizing_mode not in ("margin", "notional"):
+if CFG.broker not in ("bitunix", "paper"):
+    CFG.broker = "bitunix"
+if CFG.sizing_mode not in ("margin", "notional", "risk"):
     CFG.sizing_mode = "margin"
 if CFG.tp_mode not in ("partials", "single"):
     CFG.tp_mode = "partials"
@@ -610,6 +630,12 @@ class Bitunix:
                         continue
         return None
 
+    def klines(self, symbol: str, interval: str = "1m", limit: int = 3) -> list[dict]:
+        """Velas recientes (las más nuevas primero): open/high/low/close y `time` de apertura en ms."""
+        data = self._call("GET", "/api/v1/futures/market/kline",
+                          params={"symbol": symbol, "interval": interval, "limit": limit}, auth=False)
+        return data if isinstance(data, list) else []
+
     # ---- cuenta / posiciones --------------------------------------------------------
     def account(self) -> dict:
         data = self._call("GET", "/api/v1/futures/account", params={"marginCoin": self.cfg.margin_coin})
@@ -895,6 +921,17 @@ class State:
 
 STATE = State(Path(CFG.state_file) if Path(CFG.state_file).is_absolute() else SCRIPT_DIR / CFG.state_file)
 EX = Bitunix(CFG)
+
+
+def _local(path: str) -> Path:
+    return Path(path) if Path(path).is_absolute() else SCRIPT_DIR / path
+
+
+if CFG.broker == "paper":
+    from paper import PaperExchange
+    EX = PaperExchange(CFG, EX, _local(CFG.paper_state_file), _local(CFG.paper_journal_file),
+                       log=lambda level, msg: log(level, msg), error_cls=BitunixError)
+PAPER = CFG.broker == "paper"
 START_TS = time.time()
 
 
@@ -944,7 +981,7 @@ def plan_trade(sig: Signal) -> dict:
                 f"entrada {entry} a {deviation:.2f}% del mercado ({market}); "
                 f"sube MAX_PRICE_DEVIATION_PCT si es intencional")
 
-    if CFG.dry_run and not (CFG.api_key and CFG.api_secret):
+    if CFG.dry_run and not PAPER and not (CFG.api_key and CFG.api_secret):
         equity = available = _dry_equity()            # sin claves: ni lo intentamos
     else:
         try:
@@ -955,7 +992,13 @@ def plan_trade(sig: Signal) -> dict:
             equity = available = _dry_equity()
             log("WARNING", f"dry-run: sin equity real ({exc.msg}); uso {equity:.2f} simulado")
     pct = CFG.position_size_pct / 100.0
-    if CFG.sizing_mode == "notional":
+    if CFG.sizing_mode == "risk":
+        # Riesgo fijo: si salta el SL de la señal se pierde RISK_PCT del equity (sin comisiones).
+        stop_dist = abs(entry - float(fmt_price(sig.sl, price_places))) / entry
+        if stop_dist <= 0:
+            raise SignalError("SL igual a la entrada: no se puede dimensionar por riesgo")
+        notional = equity * CFG.risk_pct / 100.0 / stop_dist
+    elif CFG.sizing_mode == "notional":
         notional = equity * pct
     else:
         notional = equity * pct * leverage
@@ -1078,7 +1121,7 @@ def handle_signal(payload: Any, origin: str = "webhook") -> dict:
     if CFG.max_open_positions > 0 and len(STATE.active()) >= CFG.max_open_positions:
         return {"ok": False, "error": f"límite de {CFG.max_open_positions} operaciones activas"}
 
-    if not CFG.allow_reverse and CFG.api_key and CFG.api_secret:
+    if not CFG.allow_reverse and (PAPER or (CFG.api_key and CFG.api_secret)):
         try:
             for pos in EX.pending_positions(sig.symbol):
                 if norm_ex_side(pos.get("side")) != sig.side:
@@ -1658,12 +1701,12 @@ def handle_webhook(body: str, remote: str = "?", token: str | None = None,
 
 def health_payload() -> dict:
     return {"ok": True, "active": len(STATE.active()), "records": len(STATE.positions),
-            "events": len(EVENTS), "dry_run": CFG.dry_run, "time": time.time()}
+            "events": len(EVENTS), "dry_run": CFG.dry_run, "broker": CFG.broker, "time": time.time()}
 
 
 def account_snapshot() -> tuple[float | None, float | None, str | None]:
     """(equity, disponible, error): en dry-run cae en el equity simulado en vez de fallar."""
-    if CFG.dry_run and not (CFG.api_key and CFG.api_secret):
+    if CFG.dry_run and not PAPER and not (CFG.api_key and CFG.api_secret):
         base = _dry_equity()
         return base, base, None
     try:
@@ -1711,7 +1754,7 @@ def status_payload() -> dict:
             "be_after_tp": CFG.be_after_tp, "be_offset_pct": CFG.be_offset_pct,
             "max_open_positions": CFG.max_open_positions,
             "dedupe_window_sec": CFG.dedupe_window_sec,
-            "dry_run": CFG.dry_run,
+            "dry_run": CFG.dry_run, "broker": CFG.broker, "risk_pct": CFG.risk_pct,
         },
         "margin_in_use": round(committed_margin(), 4),
         "counters": STATE.counts(), "lasts": STATE.lasts(), "samples": len(STATE.metrics),
@@ -1870,14 +1913,19 @@ class StdHTTPHandler(BaseHTTPRequestHandler):
 
 
 def run_server() -> None:
-    if not CFG.api_key or not CFG.api_secret:
+    if PAPER:
+        log("INFO", f"PAPER: órdenes simuladas sobre precios reales de Bitunix "
+                    f"(equity {EX.equity()[0]:.2f} USDT, journal {CFG.paper_journal_file})")
+    elif not CFG.api_key or not CFG.api_secret:
         if CFG.dry_run:
             log("WARNING", "sin API key (modo dry-run)")
         else:
             raise SystemExit("Define BITUNIX_API_KEY y BITUNIX_API_SECRET en .env (o usa DRY_RUN=true)")
 
     tiene_claves = bool(CFG.api_key and CFG.api_secret)
-    if not tiene_claves:
+    if PAPER:
+        pass
+    elif not tiene_claves:
         log("INFO", "dry-run sin claves: no llamo a ningún endpoint privado")
     else:
         try:
@@ -1894,7 +1942,8 @@ def run_server() -> None:
         sample_metrics(force=True)
     except Exception as exc:
         log("DEBUG", f"primera muestra de métricas falló: {exc!r}")
-    log("INFO", f"config: size={CFG.position_size_pct}% ({CFG.sizing_mode}) "
+    log("INFO", f"config: broker={CFG.broker} size={CFG.position_size_pct}% ({CFG.sizing_mode}"
+                f"{f', riesgo {CFG.risk_pct}%' if CFG.sizing_mode == 'risk' else ''}) "
                 f"lev=x{CFG.default_leverage} tope margen total={CFG.max_total_margin_pct}% "
                 f"margen={CFG.margin_mode} entrada={CFG.entry_order_type} TP={CFG.tp_mode} "
                 f"BE={'sí' if CFG.be_enabled else 'no'} offset={CFG.be_offset_pct}% "

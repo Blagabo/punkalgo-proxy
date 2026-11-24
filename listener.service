@@ -1,0 +1,27 @@
+[Unit]
+Description=listener: canal de Telegram -> webhook del proxy
+After=network-online.target proxy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Ajusta la ruta y el usuario a tu VPS.
+User=trader
+Group=trader
+WorkingDirectory=/opt/proxy
+ExecStart=/opt/proxy/.venv/bin/python /opt/proxy/listener.py
+# El .env vive junto al script; systemd no lo lee solo, pero proxy.py sí lo carga.
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=UTC
+
+# Recursos / seguridad
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
