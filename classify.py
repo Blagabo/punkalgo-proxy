@@ -3,6 +3,7 @@ classify.py — qué tipo de mensaje publica el canal de señales.
 
     signal      señal operable: par, Long/Short, Entrada, Stop Loss y objetivos
     target_hit  "Objetivo N Tocado" (beneficio en % apalancado, periodo, aviso de BE)
+    sl_hit      "Stop Loss Alcanzado" (pérdida en % apalancado)
     pump        "PAR/USDT Pumpeando +X%" (informativo, no se opera)
     other       cualquier otra cosa
 
@@ -21,6 +22,8 @@ RE_ENTRY = re.compile(r"\bentrada\b", re.I)
 RE_SL = re.compile(r"\bstop\s*loss\b", re.I)
 RE_TARGET = re.compile(r"\bobjetivo\s*\d", re.I)
 RE_HIT = re.compile(r"\bobjetivo\s*(\d+)\s*tocado", re.I)
+RE_SL_HIT = re.compile(r"stop\s*loss\s*alcanzado", re.I)
+RE_LOSS = re.compile(r"p[ée]rdida\s*:?\s*([+-]?\d+(?:[.,]\d+)?)\s*%", re.I)
 RE_PROFIT = re.compile(r"beneficio\s*:?\s*([+-]?\d+(?:[.,]\d+)?)\s*%", re.I)
 RE_PERIOD = re.compile(r"periodo\s*:?\s*(?:(\d+)\s*horas?)?\s*(?:(\d+)\s*minutos?)?", re.I)
 RE_BE = re.compile(r"break\s*even|sl\s+a\s+la\s+entrada", re.I)
@@ -51,6 +54,10 @@ def classify(text: str) -> dict[str, Any]:
         return {"type": "target_hit", "symbol": symbol, "target": int(hit.group(1)),
                 "profit_pct": _num(m.group(1)) if (m := RE_PROFIT.search(text)) else None,
                 "minutes": minutes, "move_to_be": bool(RE_BE.search(text))}
+
+    if RE_SL_HIT.search(text):
+        return {"type": "sl_hit", "symbol": symbol,
+                "loss_pct": _num(m.group(1)) if (m := RE_LOSS.search(text)) else None}
 
     pump = RE_PUMP.search(text)
     if pump:
