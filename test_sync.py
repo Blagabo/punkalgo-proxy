@@ -44,11 +44,15 @@ ORDI = "#ORDI/USDT \n\nStop Loss Alcanzado ⛔\n\nPérdida: -66.1903% 📉"
      "tps": [5.2], "qty": "10", "leverage": 20, "order_id": "PO20", "created": 1795000600,
      "note": "entrada sin fill, cancelada por TTL de 900s"},
     {"id": "pxD", "symbol": "XUSDT", "side": "LONG", "status": "DRY_RUN", "created": 1795000700},
+    {"id": "pxE", "symbol": "SOLUSDT", "side": "LONG", "status": "WAITING_FILL", "entry_price": 182.4, "sl": 178.1,
+     "tps": [190], "qty": "1.1", "leverage": 20, "order_id": "PO30", "created": 1795000800},
 ]}), encoding="utf-8")
 (TMP / "paper.json").write_text(json.dumps({"start_equity": 1000, "positions": {"PP10": {
-    "client_id": "pxB", "avgOpenPrice": "0.37362526", "ctime": 1795000300000, "fees": 0.18,
-    "fills": [{"kind": "ENTRY", "price": 0.3736, "qty": 819}, {"kind": "TP 0.3672", "price": 0.3672, "qty": 163.8}]}}}),
-    encoding="utf-8")
+    "client_id": "pxB", "side": "SHORT", "avgOpenPrice": "0.37362526", "ctime": 1795000300000, "fees": 0.18,
+    "qty": "655.2", "qty_open": "819", "sl": "0.3736", "sl_initial": "0.3797", "mark": 0.37, "realized": 1.0,
+    "fills": [{"kind": "ENTRY", "price": 0.3736, "qty": 819, "fee": 0.18},
+              {"kind": "TP 0.3672", "price": 0.3672, "qty": 163.8}]}},
+    "orders": {"PO30": {"clientId": "pxE", "status": "NEW", "mark": 182.0}}}), encoding="utf-8")
 (TMP / "journal.jsonl").write_text(json.dumps({
     "client_id": "pxA", "symbol": "NEARUSDT", "side": "SHORT", "leverage": 20, "signal_entry": "2.886",
     "entry": 2.8864, "qty": 83, "sl_initial": 2.946, "opened_ms": 1795000001000, "closed_ms": 1795003600000,
@@ -72,12 +76,19 @@ def main() -> int:
         (msgs[743]["type"] == "sl_hit" and msgs[743]["info"]["loss_pct"] == -66.1903,
          f"743 reclasificado como sl_hit: {msgs[743]['type']}"),
         (msgs[744]["outcome"].startswith("rechazada"), f"744 rechazada: {msgs[744]['outcome']}"),
-        (set(trades) == {"pxA", "pxB", "pxC"}, f"DRY_RUN fuera: {sorted(trades)}"),
+        (set(trades) == {"pxA", "pxB", "pxC", "pxE"}, f"DRY_RUN fuera: {sorted(trades)}"),
         (trades["pxA"]["status"] == "closed" and trades["pxA"]["r"] == 0.24 and trades["pxA"]["tps_hit"] == 1
          and trades["pxA"]["msg_id"] == 742 and trades["pxA"]["be_done"], "pxA cerrada con R, TP1, BE y mensaje"),
         (trades["pxB"]["status"] == "open" and trades["pxB"]["tps_hit"] == 1
          and abs(trades["pxB"]["fill_price"] - 0.37362526) < 1e-9, "pxB abierta con fill y 1 TP"),
         (trades["pxC"]["status"] == "expired", f"pxC caducada por TTL: {trades['pxC']['status']}"),
+        # short 819 @ 0.37362526, SL 0.3797: riesgo 4.9752; quedan 655.2 a 0.37 y 1.0 cobrado - 0.18 de fee
+        (abs(trades["pxB"]["risk"] - 0.00607474 * 819) < 1e-5 and abs(trades["pxB"]["upnl"] - (1.0 - 0.18 + 0.00362526 * 655.2)) < 1e-5
+         and abs(trades["pxB"]["r_now"] - trades["pxB"]["upnl"] / trades["pxB"]["risk"]) < 1e-3
+         and trades["pxB"]["mark"] == 0.37 and trades["pxB"]["sl_now"] == "0.3736",
+         f"pxB en vivo: precio, SL vigente, PnL {trades['pxB']['upnl']} y {trades['pxB']['r_now']}R"),
+        (trades["pxE"]["status"] == "waiting" and trades["pxE"]["mark"] == 182.0, "pxE esperando con su precio actual"),
+        (abs(trades["pxA"]["risk"] - 4.9468) < 1e-3, f"riesgo de la cerrada: {trades['pxA']['risk']}"),
         (sent["bot_status"][0]["equity"] == 999.5 and sent["bot_status"][0]["start_equity"] == 1000
          and sent["bot_status"][0]["active"] == 1, "bot_status con equity, inicial y activas"),
         (len(sent.get("bot_equity", [])) == 1, "primera muestra de equity"),

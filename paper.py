@@ -274,6 +274,7 @@ class PaperExchange:
         for order in list(self.s["orders"].values()):
             if order["symbol"] != symbol or order["status"] != "NEW":
                 continue
+            order["mark"] = last                   # para mostrar el precio mientras espera
             px = float(order["price"])
             touched = lo <= px if order["side"] == "BUY" else hi >= px
             if touched:
