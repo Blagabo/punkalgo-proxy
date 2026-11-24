@@ -5,3 +5,8 @@ proxy.log
 proxy_state.json
 *.tmp
 .venv/
+paper_state.json
+paper_trades.jsonl
+tg_messages.jsonl
+*.session
+*.session-journal

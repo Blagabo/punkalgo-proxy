@@ -53,6 +53,37 @@ Ignora mayúsculas y minúsculas y el orden de los objetivos: valida que queden 
 profit y los ordena por precio (`Objetivo 1` siempre es el primero que se ejecuta). Detecta
 `Long`/`Short` por texto o por los emojis 🔴 🟢.
 
+## Paper trading (BROKER=paper)
+
+Bitunix no tiene testnet, así que `paper.py` simula el exchange **sobre precios reales**:
+pares, tick, tamaño mínimo, último precio y velas de 1 m salen de la API pública de Bitunix
+(sin claves) y las órdenes, posiciones y saldo viven en local (`PAPER_STATE_FILE`). Todo el
+ciclo del bot (fill, SL, TP parciales, break-even, cierre) corre sin cambios.
+
+* Entrada LIMIT: se llena al tocar el precio (comisión maker); si ya es ejecutable al
+  colocarla, al precio de mercado (taker). Las mechas entre consultas se detectan con el
+  máximo/mínimo nuevo de la vela de 1 m.
+* Conservador: si en el mismo rango caben SL y TP, o el fill y el SL, gana el SL.
+* Comisiones y slippage configurables (`PAPER_*`); comprueba las de tu nivel en Bitunix.
+* Cada operación cerrada va a `PAPER_JOURNAL_FILE` (JSON por línea): fills, comisiones,
+  PnL neto y resultado en R sobre el SL original.
+
+Con `SIZING_MODE=risk` el tamaño sale del SL: se arriesga `RISK_PCT` del equity por
+operación (0.5 % de 1 000 USDT con entrada 6.102 y SL 6.296 → 25.7 INJ, ~157 USDT nocionales).
+
+## Listener de Telegram
+
+`listener.py` lee el canal con **tu cuenta** (Telethon, nunca escribe) y manda las señales
+al webhook local. `classify.py` separa los mensajes en `signal`, `target_hit`
+("Objetivo N Tocado"), `pump` y `other`; todos se guardan en `MESSAGES_FILE` y sólo las
+señales recientes (`SIGNAL_MAX_AGE_SEC`) llegan al proxy.
+
+```bash
+python listener.py login      # una vez: teléfono, código y 2FA
+python listener.py channels   # id del canal para TG_CHANNEL
+python listener.py            # escuchar (unit systemd `listener`)
+```
+
 ## Endpoints
 
 | Método | Ruta | Auth | Descripción |
@@ -167,6 +198,8 @@ Pruebas locales:
 ```bash
 ./proxy selftest           # parsing, reparto de TPs y break-even (sin red)
 python3 test_monitor.py    # ciclo de vida completo contra un exchange simulado
+python3 test_paper.py      # modo paper: fills, mechas, TP, BE, SL conservador, journal en R
+python3 test_classify.py   # tipos de mensaje del canal
 bash test_webhook.sh       # levanta el servidor en DRY_RUN y dispara 5 requests
 ./proxy parse signals/sample.txt
 ./proxy status

@@ -4,3 +4,5 @@
 requests>=2.31
 flask>=3.0
 waitress>=3.0
+# Listener de Telegram (listener.py): lee el canal con tu cuenta.
+telethon>=1.36

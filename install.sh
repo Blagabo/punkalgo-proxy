@@ -10,7 +10,7 @@ SERVICE_USER="${SERVICE_USER:-trader}"
 
 echo "== copiando $SRC -> $DEST"
 mkdir -p "$DEST"
-cp -a "$SRC"/proxy.py "$SRC"/proxy "$SRC"/requirements.txt "$SRC"/proxy.service "$SRC"/signals "$DEST"/
+cp -a "$SRC"/proxy.py "$SRC"/paper.py "$SRC"/classify.py "$SRC"/listener.py "$SRC"/proxy \n      "$SRC"/requirements.txt "$SRC"/proxy.service "$SRC"/listener.service "$SRC"/signals "$DEST"/
 [ -f "$SRC/.env" ] && cp -a "$SRC/.env" "$DEST"/.env
 [ -f "$SRC/.env.example" ] && cp -a "$SRC/.env.example" "$DEST"/.env.example
 chmod 600 "$DEST/.env" 2>/dev/null || true
@@ -40,8 +40,11 @@ chown -R "$SERVICE_USER:$SERVICE_USER" "$DEST"
 echo "== instalando servicio systemd"
 install -m 644 "$DEST/proxy.service" /etc/systemd/system/proxy.service
 sed -i "s#^WorkingDirectory=.*#WorkingDirectory=$DEST#; s#^ExecStart=.*#ExecStart=$DEST/proxy serve#; s#^User=.*#User=$SERVICE_USER#; s#^Group=.*#Group=$SERVICE_USER#" /etc/systemd/system/proxy.service
+install -m 644 "$DEST/listener.service" /etc/systemd/system/listener.service
+sed -i "s#^WorkingDirectory=.*#WorkingDirectory=$DEST#; s#^ExecStart=.*#ExecStart=$DEST/.venv/bin/python $DEST/listener.py#; s#^User=.*#User=$SERVICE_USER#; s#^Group=.*#Group=$SERVICE_USER#" /etc/systemd/system/listener.service
 systemctl daemon-reload
 systemctl enable proxy.service
+# el listener se habilita a mano tras `listener.py login` (necesita la sesión de Telegram)
 
 cat <<EOF
 
@@ -58,7 +61,12 @@ Instalado. Siguientes pasos:
      curl -X POST -H "X-Webhook-Token: \$WEBHOOK_TOKEN" \\
           --data-binary @$DEST/signals/sample.txt http://127.0.0.1:8080/webhook
 
-  4. TLS (recomendado): pone nginx/caddy adelante y apunta tu software a
+  4. Listener de Telegram (TG_API_ID, TG_API_HASH y TG_CHANNEL en .env):
+     sudo -u $SERVICE_USER $DEST/.venv/bin/python $DEST/listener.py login
+     sudo -u $SERVICE_USER $DEST/.venv/bin/python $DEST/listener.py channels
+     systemctl enable --now listener && journalctl -u listener -f
+
+  5. TLS (recomendado): pone nginx/caddy adelante y apunta tu software a
      https://tu-dominio/webhook
 
 EOF
