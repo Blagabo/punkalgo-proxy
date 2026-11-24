@@ -1,0 +1,53 @@
+# Bot de señales: proxy (webhook + paper/Bitunix) y listener de Telegram.
+#
+#   mkdir -p data && chown 10001:10001 data      # una vez, antes del primer arranque
+#   docker compose up -d --build                  # sólo el proxy
+#   docker compose run --rm listener python listener.py login      # una vez, interactivo
+#   docker compose run --rm listener python listener.py channels
+#   docker compose --profile listener up -d       # proxy + listener
+#
+# Ningún puerto se publica en el host: el listener llega al proxy por la red interna.
+name: punkchainer-bot
+
+x-common: &common
+  build: .
+  image: punkchainer-bot:latest
+  restart: unless-stopped
+  env_file: .env
+  volumes:
+    - ./data:/data
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "5" }
+
+services:
+  proxy:
+    <<: *common
+    environment:
+      PROXY_HOST: 0.0.0.0
+      PROXY_PORT: "8080"
+      STATE_FILE: /data/proxy_state.json
+      LOG_FILE: /data/proxy.log
+      PAPER_STATE_FILE: /data/paper_state.json
+      PAPER_JOURNAL_FILE: /data/paper_trades.jsonl
+    # Fase 3 (Hermes supervisa): descomentar para que Hermes llegue a http://proxy:8080/status
+    # networks: [default, hermes]
+
+  listener:
+    <<: *common
+    profiles: ["listener"]
+    command: ["python", "listener.py"]
+    environment:
+      PROXY_URL: http://proxy:8080/webhook
+      TG_SESSION: /data/tg_listener
+      MESSAGES_FILE: /data/tg_messages.jsonl
+    depends_on:
+      proxy:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+# networks:
+#   hermes:
+#     external: true
+#     name: hermes-agent-gofy_default

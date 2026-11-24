@@ -185,6 +185,23 @@ sudo nano /opt/proxy/.env                 # API key, secret, WEBHOOK_TOKEN, DRY_
 sudo systemctl start proxy && journalctl -u proxy -f
 ```
 
+Con Docker (lo que usa el VPS de Hostinger, `/docker/punkchainer-bot`): una imagen para los
+dos servicios y todo lo que se escribe en `./data`. No se publica ningún puerto en el host.
+
+```bash
+git clone https://github.com/Blagabo/punkalgo-proxy.git /docker/punkchainer-bot
+cd /docker/punkchainer-bot
+cp .env.example .env && chmod 600 .env && nano .env      # BROKER=paper, WEBHOOK_TOKEN…
+mkdir -p data && chown 10001:10001 data
+docker compose build
+docker compose run --rm proxy sh -c "./proxy selftest && python test_paper.py && python test_classify.py"
+docker compose up -d && docker compose logs -f proxy
+# listener: login (interactivo) y canal, luego arrancarlo
+docker compose run --rm listener python listener.py login
+docker compose run --rm listener python listener.py channels
+docker compose --profile listener up -d
+```
+
 Sin instalador (venv a mano):
 
 ```bash
