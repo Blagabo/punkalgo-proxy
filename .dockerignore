@@ -1,0 +1,13 @@
+.git
+.venv
+.env
+data
+__pycache__
+*.pyc
+*.session
+*.session-journal
+proxy.log
+proxy_state.json
+paper_state.json
+paper_trades.jsonl
+tg_messages.jsonl

@@ -10,3 +10,4 @@ paper_trades.jsonl
 tg_messages.jsonl
 *.session
 *.session-journal
+data/
