@@ -48,6 +48,11 @@ Periodo: 35 Minutos ⏰""",
 
 Beneficio: 51.2% 📈
 Periodo: 2 Horas 5 Minutos ⏰""", {"type": "target_hit", "target": 3, "minutes": 125}),
+    ("""#ORDI/USDT 
+
+Stop Loss Alcanzado ⛔
+
+Pérdida: -66.1903% 📉""", {"type": "sl_hit", "symbol": "ORDIUSDT", "loss_pct": -66.1903}),
     ("Buenos días a todos, hoy mercado lateral", {"type": "other", "symbol": None}),
 ]
 
