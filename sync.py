@@ -73,7 +73,7 @@ CACHE = local("SYNC_CACHE_FILE", "sync_cache.json")
 
 TRADE_COLS = ("user_id", "bot", "id", "msg_id", "symbol", "side", "status", "signal_at", "entry", "sl", "tps",
               "leverage", "qty", "notional", "fill_price", "opened_at", "closed_at", "close_reason", "be_done",
-              "tps_hit", "fees", "pnl", "r", "fills", "note")
+              "tps_hit", "fees", "pnl", "r", "fills", "note", "mark", "sl_now", "upnl", "r_now", "risk")
 
 
 def log(msg: str) -> None:
@@ -170,6 +170,8 @@ def build_trades(state: dict, paper: dict, journal: list[dict],
                  msg_of_trade: dict[str, int]) -> list[dict]:
     closed = {str(j.get("client_id")): j for j in journal if j.get("client_id")}
     live = {str(p.get("client_id")): p for p in (paper.get("positions") or {}).values() if p.get("client_id")}
+    waiting = {str(o.get("clientId")): o for o in (paper.get("orders") or {}).values()
+               if o.get("clientId") and o.get("status") == "NEW"}
     rows: dict[str, dict] = {}
 
     for cid, j in closed.items():             # cerradas: el journal manda
@@ -181,7 +183,7 @@ def build_trades(state: dict, paper: dict, journal: list[dict],
             "fill_price": j.get("entry"), "opened_at": iso(j.get("opened_ms"), ms=True),
             "closed_at": iso(j.get("closed_ms"), ms=True), "close_reason": j.get("close_reason"),
             "tps_hit": tp_hits(fills), "fees": j.get("fees"), "pnl": j.get("pnl"), "r": j.get("r"),
-            "fills": fills,
+            "fills": fills, "risk": risk_of(j.get("entry"), j.get("sl_initial"), j.get("qty")),
         }
 
     for rec in state.get("positions") or []:  # el estado del proxy añade la señal y lo vivo
@@ -198,14 +200,36 @@ def build_trades(state: dict, paper: dict, journal: list[dict],
             "notional": rec.get("notional"), "be_done": bool(rec.get("be_done")),
             "note": rec.get("note") or None,
         })
-        if pos:                               # abierta en el paper: fills y TPs hasta ahora
-            fills = pos.get("fills") or []
-            row.update({"fill_price": float(pos["avgOpenPrice"]), "opened_at": iso(pos.get("ctime"), ms=True),
-                        "tps_hit": tp_hits(fills), "fills": fills, "fees": pos.get("fees")})
+        if pos:                               # abierta en el paper: fills, TPs y PnL hasta ahora
+            row.update(live_fields(pos))
+        elif status == "waiting" and cid in waiting:
+            row["mark"] = waiting[cid].get("mark")
 
     for cid, row in rows.items():
         row.update(user_id=OWNER, bot=BOT, msg_id=msg_of_trade.get(cid))
     return [r for r in rows.values() if r.get("signal_at")]
+
+
+def risk_of(entry: object, sl: object, qty: object) -> float | None:
+    try:
+        return round(abs(float(entry) - float(sl)) * float(qty), 6) if entry and sl and qty else None
+    except (TypeError, ValueError):
+        return None
+
+
+def live_fields(pos: dict) -> dict:
+    """Posición abierta del paper: precio actual, SL vigente y PnL/R flotantes (sin la comisión
+    de salida). El PnL incluye los TP parciales ya cobrados y la comisión de entrada."""
+    fills = pos.get("fills") or []
+    entry = float(pos["avgOpenPrice"])
+    mark = float(pos.get("mark") or entry)
+    sign = -1.0 if pos.get("side") == "SHORT" else 1.0
+    entry_fee = float(fills[0].get("fee") or 0) if fills else 0.0
+    upnl = float(pos.get("realized") or 0) - entry_fee + (mark - entry) * sign * float(pos.get("qty") or 0)
+    risk = risk_of(entry, pos.get("sl_initial"), pos.get("qty_open"))
+    return {"fill_price": entry, "opened_at": iso(pos.get("ctime"), ms=True), "tps_hit": tp_hits(fills),
+            "fills": fills, "fees": pos.get("fees"), "mark": mark, "sl_now": pos.get("sl"),
+            "upnl": round(upnl, 6), "risk": risk, "r_now": round(upnl / risk, 4) if risk else None}
 
 
 # ---- Supabase --------------------------------------------------------------------------------
