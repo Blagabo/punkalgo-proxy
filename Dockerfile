@@ -7,9 +7,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY proxy proxy.py paper.py classify.py listener.py ./
+COPY proxy proxy.py paper.py classify.py listener.py sync.py ./
 COPY signals ./signals
-COPY test_paper.py test_classify.py ./
+COPY test_paper.py test_classify.py test_sync.py ./
 
 # Usuario sin privilegios; todo lo que se escribe (estado, journal, logs, sesión de
 # Telegram) va al volumen /data.

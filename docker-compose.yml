@@ -6,6 +6,9 @@
 #   docker compose run --rm listener python listener.py channels
 #   docker compose --profile listener up -d       # proxy + listener
 #
+# Con COMPOSE_PROFILES=listener,sync en el .env basta con `docker compose up -d`.
+# `sync` copia el estado a Supabase (TrackerProps → Bots): necesita SUPABASE_* y BOT_OWNER_ID.
+#
 # Ningún puerto se publica en el host: el listener llega al proxy por la red interna.
 name: punkchainer-bot
 
@@ -41,6 +44,23 @@ services:
       PROXY_URL: http://proxy:8080/webhook
       TG_SESSION: /data/tg_listener
       MESSAGES_FILE: /data/tg_messages.jsonl
+    depends_on:
+      proxy:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+  sync:
+    <<: *common
+    profiles: ["sync"]
+    command: ["python", "sync.py"]
+    environment:
+      PROXY_STATUS_URL: http://proxy:8080/status
+      STATE_FILE: /data/proxy_state.json
+      PAPER_STATE_FILE: /data/paper_state.json
+      PAPER_JOURNAL_FILE: /data/paper_trades.jsonl
+      MESSAGES_FILE: /data/tg_messages.jsonl
+      SYNC_CACHE_FILE: /data/sync_cache.json
     depends_on:
       proxy:
         condition: service_healthy

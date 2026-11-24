@@ -84,6 +84,15 @@ python listener.py channels   # id del canal para TG_CHANNEL
 python listener.py            # escuchar (unit systemd `listener`)
 ```
 
+## Sync a Supabase (web)
+
+`sync.py` copia cada `SYNC_INTERVAL_SEC` el estado del bot a Supabase para la sección Bots
+de TrackerProps (migración `0005_bots.sql`): `bot_status`, `bot_equity` (una muestra cada
+`EQUITY_EVERY_SEC`), `bot_trades` y `bot_messages` (reclasificados con el `classify.py`
+actual). Solo lee los archivos de `/data` y el `/status` del proxy, y solo envía filas que
+cambian. Usa la clave secreta de Supabase, que no sale del `.env` del VPS. Con
+`COMPOSE_PROFILES=listener,sync` en el `.env`, `docker compose up -d` lo arranca todo.
+
 ## Endpoints
 
 | Método | Ruta | Auth | Descripción |
@@ -217,6 +226,7 @@ Pruebas locales:
 python3 test_monitor.py    # ciclo de vida completo contra un exchange simulado
 python3 test_paper.py      # modo paper: fills, mechas, TP, BE, SL conservador, journal en R
 python3 test_classify.py   # tipos de mensaje del canal
+python3 test_sync.py       # filas que se mandan a Supabase
 bash test_webhook.sh       # levanta el servidor en DRY_RUN y dispara 5 requests
 ./proxy parse signals/sample.txt
 ./proxy status
