@@ -99,12 +99,37 @@ def main() -> int:
     results.append((proxy.risk_guard({"equity": 989.0, "entry": 1, "sl": 1.01, "qty": 1}, None) is None,
                     "al día siguiente (UTC) el freno ya no aplica"))
 
+    # ---- frenos en caliente ----------------------------------------------------------------
+    proxy.STATE.daily = {}
+    proxy.CFG.daily_loss_limit_pct = 1.0
+    proxy.note_day_equity(1000.0)
+    proxy.note_day_equity(985.0)                         # −1,5%: freno activo
+    halted_before = proxy.STATE.daily[proxy.day_key()].get("halted")
+    st, rep = proxy.guards_action({"daily_loss_limit_pct": 0, "max_open_risk_pct": 3}, origin="test")
+    saved = json.loads(Path(os.environ["RUNTIME_FILE"]).read_text(encoding="utf-8"))
+    results.append((halted_before and st == 200 and rep["daily_loss_limit_pct"] == 0 and rep["max_open_risk_pct"] == 3
+                    and not proxy.guards_payload(985.0)["halted"] and saved == {"daily_loss_limit_pct": 0, "max_open_risk_pct": 3},
+                    f"desactivar el freno diario lo levanta y se guarda: {saved}"))
+    proxy.CFG.max_open_risk_pct = 0
+    proxy.load_runtime()
+    results.append((proxy.CFG.max_open_risk_pct == 3, "tras un reinicio se recarga el valor de la web"))
+    st, rep = proxy.guards_action({"daily_loss_limit_pct": 30})
+    results.append((st == 400 and "entre 0 y 20" in rep["error"] and proxy.CFG.daily_loss_limit_pct == 0,
+                    f"fuera de rango: 400 sin cambiar nada ({rep['error']})"))
+    st, rep = proxy.guards_action({"foo": 1})
+    results.append((st == 400, "sin campos válidos: 400"))
+
     # ---- rutas HTTP con token --------------------------------------------------------------
     proxy.CFG.webhook_token = "tok"
     st, _, _ = proxy.http_dispatch("POST", "/api/close-all", {}, {}, "{}")
     results.append((st == 401, "/api/close-all sin token: 401"))
     st, body, _ = proxy.http_dispatch("POST", "/api/close", {"X-Webhook-Token": "tok"}, {}, '{"symbol": "XRPUSDT"}')
     results.append((st == 404 and body["ok"] is False, "/api/close con token y par sin operación: 404"))
+    st, body, _ = proxy.http_dispatch("POST", "/api/guards", {"X-Webhook-Token": "tok"}, {}, '{"daily_loss_limit_pct": 2.5}')
+    results.append((st == 200 and body["daily_loss_limit_pct"] == 2.5 and body["max_open_risk_pct"] == 3,
+                    "/api/guards cambia solo el campo enviado"))
+    st, _, _ = proxy.http_dispatch("POST", "/api/guards", {}, {}, '{"daily_loss_limit_pct": 2}')
+    results.append((st == 401, "/api/guards sin token: 401"))
 
     print()
     ok = True

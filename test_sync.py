@@ -124,6 +124,8 @@ def main() -> int:
     now = _t.time()
     calls = []
     cmds = [{"id": "c1", "action": "close", "target": "pxB", "created_at": sync.iso(now - 5)},
+            {"id": "c3", "action": "set_guards", "target": None, "params": {"daily_loss_limit_pct": 2, "max_open_risk_pct": 0},
+             "created_at": sync.iso(now - 2)},
             {"id": "c2", "action": "close_all", "target": None, "created_at": sync.iso(now - 3600)}]
 
     class FakeRequests:
@@ -135,6 +137,8 @@ def main() -> int:
         @staticmethod
         def post(url, **kw):
             calls.append(("post", url, kw.get("json"), kw.get("headers")))
+            if url.endswith("/api/guards"):
+                return Resp(200, {"ok": True, "daily_loss_limit_pct": 2, "max_open_risk_pct": 0})
             return Resp(200, {"ok": True, "done": [{"symbol": "APTUSDT", "action": "closed"}], "failed": []})
         @staticmethod
         def patch(url, **kw):
@@ -149,7 +153,12 @@ def main() -> int:
         sync.requests = real
     posts = [c for c in calls if c[0] == "post"]
     patches = {c[1]: c[2] for c in calls if c[0] == "patch"}
-    checks.append((n == 2 and len(posts) == 1 and posts[0][1].endswith("/api/close") and posts[0][2]["id"] == "pxB"
+    guard_posts = [c for c in posts if c[1].endswith("/api/guards")]
+    checks.append((len(guard_posts) == 1 and guard_posts[0][2] == {"daily_loss_limit_pct": 2, "max_open_risk_pct": 0, "origin": "web"}
+                   and patches.get("c3", {}).get("result") == "freno diario 2% · riesgo abierto desactivado",
+                   f"orden set_guards: {patches.get('c3', {}).get('result')}"))
+    posts = [c for c in posts if not c[1].endswith("/api/guards")]
+    checks.append((n == 3 and len(posts) == 1 and posts[0][1].endswith("/api/close") and posts[0][2]["id"] == "pxB"
                    and posts[0][3]["X-Webhook-Token"] == sync.TOKEN, "orden 'close' pasada al proxy con id y token"))
     checks.append((patches.get("c1", {}).get("status") == "done" and "APTUSDT cerrada" in patches["c1"]["result"],
                    f"resultado apuntado: {patches.get('c1', {}).get('result')}"))

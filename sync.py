@@ -345,6 +345,20 @@ def proxy_base() -> str:
 def run_command(cmd: dict) -> tuple[str, str]:
     """Pasa una orden de la web al proxy. Devuelve (estado, resultado legible)."""
     action, target = cmd.get("action"), (cmd.get("target") or "").strip()
+    params = cmd.get("params") if isinstance(cmd.get("params"), dict) else {}
+    if action == "set_guards":
+        body = {k: params[k] for k in ("daily_loss_limit_pct", "max_open_risk_pct") if k in params}
+        try:
+            resp = requests.post(f"{proxy_base()}/api/guards", json={**body, "origin": "web"},
+                                 headers={"X-Webhook-Token": TOKEN}, timeout=30)
+            data = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            return "failed", f"proxy sin respuesta: {exc}"
+        if not data.get("ok"):
+            return "failed", str(data.get("error") or "rechazado")[:500]
+        txt = lambda v: f"{v:g}%" if v else "desactivado"
+        return "done", (f"freno diario {txt(data['daily_loss_limit_pct'])} · "
+                        f"riesgo abierto {txt(data['max_open_risk_pct'])}")
     if action == "close_all":
         path, body = "/api/close-all", {"origin": "web"}
     elif action == "close" and target:
@@ -364,7 +378,7 @@ def run_command(cmd: dict) -> tuple[str, str]:
 
 def pending_commands() -> list[dict]:
     resp = requests.get(f"{URL}/rest/v1/bot_commands", headers=headers(), timeout=20, params={
-        "select": "id,action,target,created_at", "user_id": f"eq.{OWNER}", "bot": f"eq.{BOT}",
+        "select": "id,action,target,params,created_at", "user_id": f"eq.{OWNER}", "bot": f"eq.{BOT}",
         "status": "eq.pending", "order": "created_at.asc", "limit": "20"})
     if resp.status_code == 404 or "PGRST205" in resp.text or "does not exist" in resp.text:
         return []                             # migración 0008 aún sin aplicar
