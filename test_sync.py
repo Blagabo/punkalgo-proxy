@@ -16,6 +16,8 @@ os.environ.update({
     "STATE_FILE": str(TMP / "state.json"), "PAPER_STATE_FILE": str(TMP / "paper.json"),
     "PAPER_JOURNAL_FILE": str(TMP / "journal.jsonl"), "MESSAGES_FILE": str(TMP / "msgs.jsonl"),
     "SYNC_CACHE_FILE": str(TMP / "cache.json"),
+    "PAPER_OUTCOMES_FILE": str(TMP / "outcomes.jsonl"), "LISTENER_HEARTBEAT_FILE": str(TMP / "hb.json"),
+    "SYNC_LOG_FILE": str(TMP / "sync.log"),
 })
 
 import sync  # noqa: E402
@@ -25,7 +27,7 @@ ORDI = "#ORDI/USDT \n\nStop Loss Alcanzado ⛔\n\nPérdida: -66.1903% 📉"
 
 (TMP / "msgs.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in [
     {"ts": 1, "msg_id": 742, "date": "2026-11-24T12:35:50+00:00", "edited": False, "type": "signal",
-     "text": SIGNAL, "forwarded": True, "proxy": {"ok": True, "order_id": "PO1"}},
+     "text": SIGNAL, "forwarded": True, "proxy": {"ok": True, "order_id": "PO1"}, "delay_s": 1.4, "source": "push"},
     {"ts": 2, "msg_id": 742, "date": "2026-11-24T12:35:50+00:00", "edited": True, "type": "signal",
      "text": SIGNAL, "forwarded": False, "skip": "ya enviada"},
     {"ts": 3, "msg_id": 743, "date": "2026-11-24T12:40:06+00:00", "edited": False, "type": "other",
@@ -50,6 +52,7 @@ ORDI = "#ORDI/USDT \n\nStop Loss Alcanzado ⛔\n\nPérdida: -66.1903% 📉"
 (TMP / "paper.json").write_text(json.dumps({"start_equity": 1000, "positions": {"PP10": {
     "client_id": "pxB", "side": "SHORT", "avgOpenPrice": "0.37362526", "ctime": 1795000300000, "fees": 0.18,
     "qty": "655.2", "qty_open": "819", "sl": "0.3736", "sl_initial": "0.3797", "mark": 0.37, "realized": 1.0,
+    "best": 0.3655, "worst": 0.3760,
     "fills": [{"kind": "ENTRY", "price": 0.3736, "qty": 819, "fee": 0.18},
               {"kind": "TP 0.3672", "price": 0.3672, "qty": 163.8}]}},
     "orders": {"PO30": {"clientId": "pxE", "status": "NEW", "mark": 182.0}}}), encoding="utf-8")
@@ -57,7 +60,13 @@ ORDI = "#ORDI/USDT \n\nStop Loss Alcanzado ⛔\n\nPérdida: -66.1903% 📉"
     "client_id": "pxA", "symbol": "NEARUSDT", "side": "SHORT", "leverage": 20, "signal_entry": "2.886",
     "entry": 2.8864, "qty": 83, "sl_initial": 2.946, "opened_ms": 1795000001000, "closed_ms": 1795003600000,
     "close_reason": "BE/SL", "fills": [{"kind": "ENTRY"}, {"kind": "TP 2.836"}, {"kind": "BE/SL"}],
-    "fees": 0.3, "pnl": 1.2, "r": 0.24}) + "\n", encoding="utf-8")
+    "fees": 0.3, "pnl": 1.2, "r": 0.24, "best": 2.8268, "worst": 2.9162}) + "\n", encoding="utf-8")
+
+(TMP / "outcomes.jsonl").write_text("\n".join(json.dumps(r) for r in [
+    {"client_id": "pxA", "state": "tracking", "reach_tp": 1},
+    {"client_id": "pxA", "state": "sl", "reach_tp": 3},
+]) + "\n", encoding="utf-8")
+(TMP / "hb.json").write_text(json.dumps({"ts": 1795000000, "connected": True, "polled": 2, "late": 1}), encoding="utf-8")
 
 
 def main() -> int:
@@ -92,6 +101,14 @@ def main() -> int:
         (sent["bot_status"][0]["equity"] == 999.5 and sent["bot_status"][0]["start_equity"] == 1000
          and sent["bot_status"][0]["active"] == 1, "bot_status con equity, inicial y activas"),
         (len(sent.get("bot_equity", [])) == 1, "primera muestra de equity"),
+        (msgs[742]["delay_s"] == 1.4 and msgs[742]["source"] == "push", "mensaje con retraso y origen"),
+        # short a 2.8864 con SL 2.946 (riesgo 0.0596): mejor 2.8268 = +1R, peor 2.9162 = -0.5R
+        (abs(trades["pxA"]["mfe_r"] - 1.0) < 1e-3 and abs(trades["pxA"]["mae_r"] + 0.5) < 1e-3,
+         f"MFE/MAE en R de la cerrada: {trades['pxA']['mfe_r']} / {trades['pxA']['mae_r']}"),
+        (trades["pxA"]["reach_tp"] == 3 and trades["pxA"]["reach_state"] == "sl",
+         "seguimiento en sombra: la última línea manda (3 objetivos, terminó en SL)"),
+        (trades["pxB"]["mfe_r"] is not None, f"MFE en vivo de la abierta: {trades['pxB']['mfe_r']}"),
+        (sent["bot_status"][0]["config"]["listener"]["polled"] == 2, "latido del listener en bot_status"),
     ]
     sent.clear()
     s.once()

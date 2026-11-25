@@ -10,7 +10,9 @@ SERVICE_USER="${SERVICE_USER:-trader}"
 
 echo "== copiando $SRC -> $DEST"
 mkdir -p "$DEST"
-cp -a "$SRC"/proxy.py "$SRC"/paper.py "$SRC"/classify.py "$SRC"/listener.py "$SRC"/proxy \n      "$SRC"/requirements.txt "$SRC"/proxy.service "$SRC"/listener.service "$SRC"/signals "$DEST"/
+cp -a "$SRC"/proxy.py "$SRC"/paper.py "$SRC"/classify.py "$SRC"/listener.py "$SRC"/sync.py \
+      "$SRC"/logfile.py "$SRC"/alerts.py "$SRC"/proxy "$SRC"/requirements.txt "$SRC"/proxy.service \
+      "$SRC"/listener.service "$SRC"/signals "$DEST"/
 [ -f "$SRC/.env" ] && cp -a "$SRC/.env" "$DEST"/.env
 [ -f "$SRC/.env.example" ] && cp -a "$SRC/.env.example" "$DEST"/.env.example
 chmod 600 "$DEST/.env" 2>/dev/null || true

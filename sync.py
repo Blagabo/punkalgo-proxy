@@ -33,7 +33,9 @@ from typing import Iterable
 
 import requests
 
+from alerts import Alerts
 from classify import classify
+from logfile import append_line
 
 HERE = Path(__file__).resolve().parent
 
@@ -77,14 +79,24 @@ PAPER_STATE = local("PAPER_STATE_FILE", "paper_state.json")
 JOURNAL = local("PAPER_JOURNAL_FILE", "paper_trades.jsonl")
 MESSAGES = local("MESSAGES_FILE", "tg_messages.jsonl")
 CACHE = local("SYNC_CACHE_FILE", "sync_cache.json")
+OUTCOMES = local("PAPER_OUTCOMES_FILE", "paper_outcomes.jsonl")
+HEARTBEAT = local("LISTENER_HEARTBEAT_FILE", "listener_heartbeat.json")
+LOG_FILE = local("SYNC_LOG_FILE", "sync.log")
+ALERTS = Alerts("vigilante", state_path=local("ALERTS_STATE_FILE", "alerts_sync.json"))
+PROXY_DOWN_SEC = float(env("PROXY_DOWN_SEC", "120"))
+LISTENER_STALE_SEC = float(env("LISTENER_STALE_SEC", "360"))
+SYNC_FAIL_SEC = float(env("SYNC_FAIL_SEC", "300"))
 
 TRADE_COLS = ("user_id", "bot", "id", "msg_id", "symbol", "side", "status", "signal_at", "entry", "sl", "tps",
               "leverage", "qty", "notional", "fill_price", "opened_at", "closed_at", "close_reason", "be_done",
-              "tps_hit", "fees", "pnl", "r", "fills", "note", "mark", "sl_now", "upnl", "r_now", "risk")
+              "tps_hit", "fees", "pnl", "r", "fills", "note", "mark", "sl_now", "upnl", "r_now", "risk",
+              "mfe_r", "mae_r", "reach_tp", "reach_state")
 
 
 def log(msg: str) -> None:
-    print(f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} sync {msg}", flush=True)
+    line = f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} sync {msg}"
+    print(line, flush=True)
+    append_line(LOG_FILE, line)
 
 
 def iso(ts: float | int | None, ms: bool = False) -> str | None:
@@ -153,6 +165,7 @@ def build_messages(rows: list[dict], order_to_trade: dict[str, str]) -> list[dic
             "user_id": OWNER, "bot": BOT, "msg_id": mid,
             "posted_at": row.get("date") or iso(row.get("ts")),
             "edited": bool(row.get("edited")), "type": kind,
+            "delay_s": row.get("delay_s"), "source": row.get("source"),
             "symbol": symbol, "info": info or None,
             "outcome": outcome, "trade_id": trade_id, "text": text[:4000],
         })
@@ -175,8 +188,22 @@ def trade_status(rec: dict, closed: bool) -> str | None:
     return None                               # DRY_RUN y similares no se publican
 
 
+def excursion_r(side: str, entry: object, sl: object, best: object, worst: object) -> tuple[float | None, float | None]:
+    """MFE y MAE en R sobre el SL original (MAE negativo)."""
+    try:
+        e, s = float(entry), float(sl)
+    except (TypeError, ValueError):
+        return None, None
+    risk = abs(e - s)
+    if not risk:
+        return None, None
+    sign = -1.0 if side == "SHORT" else 1.0
+    conv = lambda p: round((float(p) - e) * sign / risk, 3) if p is not None else None
+    return conv(best), conv(worst)
+
+
 def build_trades(state: dict, paper: dict, journal: list[dict],
-                 msg_of_trade: dict[str, int]) -> list[dict]:
+                 msg_of_trade: dict[str, int], outcomes: list[dict] | None = None) -> list[dict]:
     closed = {str(j.get("client_id")): j for j in journal if j.get("client_id")}
     live = {str(p.get("client_id")): p for p in (paper.get("positions") or {}).values() if p.get("client_id")}
     waiting = {str(o.get("clientId")): o for o in (paper.get("orders") or {}).values()
@@ -194,6 +221,8 @@ def build_trades(state: dict, paper: dict, journal: list[dict],
             "tps_hit": tp_hits(fills), "fees": j.get("fees"), "pnl": j.get("pnl"), "r": j.get("r"),
             "fills": fills, "risk": risk_of(j.get("entry"), j.get("sl_initial"), j.get("qty")),
         }
+        rows[cid]["mfe_r"], rows[cid]["mae_r"] = excursion_r(j["side"], j.get("entry"), j.get("sl_initial"),
+                                                            j.get("best"), j.get("worst"))
 
     for rec in state.get("positions") or []:  # el estado del proxy añade la señal y lo vivo
         cid = str(rec.get("id"))
@@ -213,6 +242,13 @@ def build_trades(state: dict, paper: dict, journal: list[dict],
             row.update(live_fields(pos))
         elif status == "waiting" and cid in waiting:
             row["mark"] = waiting[cid].get("mark")
+
+    latest = {}
+    for o in outcomes or []:                  # seguimiento en sombra: la última línea manda
+        latest[str(o.get("client_id"))] = o
+    for cid, o in latest.items():
+        if cid in rows:
+            rows[cid].update(reach_tp=o.get("reach_tp"), reach_state=o.get("state"))
 
     for cid, row in rows.items():
         row.update(user_id=OWNER, bot=BOT, msg_id=msg_of_trade.get(cid))
@@ -238,7 +274,9 @@ def live_fields(pos: dict) -> dict:
     risk = risk_of(entry, pos.get("sl_initial"), pos.get("qty_open"))
     return {"fill_price": entry, "opened_at": iso(pos.get("ctime"), ms=True), "tps_hit": tp_hits(fills),
             "fills": fills, "fees": pos.get("fees"), "mark": mark, "sl_now": pos.get("sl"),
-            "upnl": round(upnl, 6), "risk": risk, "r_now": round(upnl / risk, 4) if risk else None}
+            "upnl": round(upnl, 6), "risk": risk, "r_now": round(upnl / risk, 4) if risk else None,
+            **dict(zip(("mfe_r", "mae_r"), excursion_r(pos.get("side", ""), entry, pos.get("sl_initial"),
+                                                       pos.get("best"), pos.get("worst"))))}
 
 
 # ---- Supabase --------------------------------------------------------------------------------
@@ -305,9 +343,11 @@ class Sync:
     def status(self) -> dict | None:
         try:
             resp = requests.get(STATUS_URL, headers={"X-Webhook-Token": TOKEN}, timeout=10)
-            return resp.json() if resp.ok else None
+            st = resp.json() if resp.ok else None
         except (requests.RequestException, ValueError):
-            return None
+            st = None
+        self.proxy_ok = st is not None
+        return st
 
     def once(self) -> str:
         state, paper = read_json(STATE), read_json(PAPER_STATE)
@@ -315,7 +355,7 @@ class Sync:
                            for r in state.get("positions") or [] if r.get("order_id")})
         messages = build_messages(read_jsonl(MESSAGES), self.links)
         msg_of_trade = {m["trade_id"]: m["msg_id"] for m in messages if m.get("trade_id")}
-        trades = self.merge_trades(build_trades(state, paper, read_jsonl(JOURNAL), msg_of_trade))
+        trades = self.merge_trades(build_trades(state, paper, read_jsonl(JOURNAL), msg_of_trade, read_jsonl(OUTCOMES)))
         self.save_cache()
 
         n_msg = self.push("bot_messages", messages, ("msg_id",))
@@ -329,7 +369,8 @@ class Sync:
                 "user_id": OWNER, "bot": BOT, "updated_at": iso(now), "broker": cfg.get("broker"),
                 "equity": st.get("equity"), "available": st.get("available"),
                 "start_equity": paper.get("start_equity"), "active": len(st.get("managed") or []),
-                "config": {**cfg, "guards": st.get("guards")}, "counters": st.get("counters"),
+                "config": {**cfg, "guards": st.get("guards"), "listener": read_json(HEARTBEAT) or None},
+                "counters": st.get("counters"),
             }], "user_id,bot")
             if st.get("equity") is not None and now - self.last_equity >= EQUITY_EVERY:
                 upsert("bot_equity", [{"user_id": OWNER, "bot": BOT, "ts": iso(int(now // 60 * 60)),
@@ -410,6 +451,57 @@ def commands() -> int:
     return n
 
 
+class Watchdog:
+    """Vigila a los demás procesos (proxy, listener) y a Supabase, y avisa por Discord."""
+
+    def __init__(self, clock=time.time) -> None:
+        self.clock = clock
+        self.proxy_down_since: float | None = None
+        self.sync_fail_since: float | None = None
+        self.started = clock()
+
+    def proxy(self, ok: bool) -> None:
+        now = self.clock()
+        if ok:
+            self.proxy_down_since = None
+            ALERTS.resolve("proxy_down", "El bot vuelve a responder")
+            return
+        self.proxy_down_since = self.proxy_down_since or now
+        if now - self.proxy_down_since >= PROXY_DOWN_SEC:
+            ALERTS.alert("proxy_down", "El bot (proxy) no responde",
+                         f"Lleva {(now - self.proxy_down_since) / 60:.0f} min sin responder: no se abren "
+                         f"señales ni se gestionan las abiertas (en real, el SL nativo sí sigue en el exchange). "
+                         f"En el VPS: `docker compose ps` y `docker compose logs --tail 50 proxy`.",
+                         level="critical", cooldown=3600)
+
+    def listener(self, hb: dict) -> None:
+        if not hb:                            # sin listener (perfil apagado): nada que vigilar
+            return
+        now = self.clock()
+        age = now - float(hb.get("ts") or 0)
+        if now - self.started < LISTENER_STALE_SEC:
+            return                            # recién arrancado: dale tiempo a latir
+        if not hb.get("connected", True) or age > LISTENER_STALE_SEC:
+            ALERTS.alert("listener_down", "El listener de Telegram no da señales de vida",
+                         f"Último latido hace {age / 60:.0f} min{'' if hb.get('connected', True) else ' (desconectado)'}: "
+                         f"no entran señales del canal. En el VPS: `docker compose logs --tail 50 listener`.",
+                         level="critical", cooldown=3600)
+        else:
+            ALERTS.resolve("listener_down", "El listener vuelve a estar conectado")
+
+    def sync_result(self, error: str | None) -> None:
+        now = self.clock()
+        if error is None:
+            self.sync_fail_since = None
+            ALERTS.resolve("sync_failing", "La web vuelve a actualizarse")
+            return
+        self.sync_fail_since = self.sync_fail_since or now
+        if now - self.sync_fail_since >= SYNC_FAIL_SEC:
+            ALERTS.alert("sync_failing", "La web no se actualiza (Supabase)",
+                         f"El sync falla desde hace {(now - self.sync_fail_since) / 60:.0f} min: {error[:400]}. "
+                         f"El bot sigue operando; solo la web va con retraso.", level="warning", cooldown=3600)
+
+
 def main(argv: list[str]) -> int:
     missing = [n for n, v in (("SUPABASE_URL", URL), ("SUPABASE_SECRET_KEY", KEY), ("BOT_OWNER_ID", OWNER)) if not v]
     if missing:
@@ -420,6 +512,7 @@ def main(argv: list[str]) -> int:
         return 0
     log(f"sincronizando «{BOT}» con {URL} cada {INTERVAL:g}s (órdenes de la web cada {COMMAND_POLL:g}s)")
     last_note, next_sync = "", 0.0
+    dog = Watchdog()
     while True:
         try:
             if commands():                    # tras cerrar algo, la web lo ve en la siguiente vuelta
@@ -432,8 +525,12 @@ def main(argv: list[str]) -> int:
                 if note != last_note:        # sin cambios no llena el log
                     log(note)
                 last_note = note
+                dog.sync_result(None)
             except Exception as exc:          # sin red o Supabase caído: reintenta en la próxima
                 log(f"error: {exc}")
+                dog.sync_result(str(exc))
+            dog.proxy(getattr(sync, "proxy_ok", True))
+            dog.listener(read_json(HEARTBEAT))
             next_sync = time.time() + INTERVAL
         time.sleep(COMMAND_POLL)
 

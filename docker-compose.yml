@@ -34,6 +34,8 @@ services:
       PAPER_STATE_FILE: /data/paper_state.json
       PAPER_JOURNAL_FILE: /data/paper_trades.jsonl
       RUNTIME_FILE: /data/runtime.json          # frenos cambiados desde la web
+      PAPER_OUTCOMES_FILE: /data/paper_outcomes.jsonl
+      ALERTS_STATE_FILE: /data/alerts_proxy.json
     # Fase 3 (Hermes supervisa): descomentar para que Hermes llegue a http://proxy:8080/status
     # networks: [default, hermes]
 
@@ -45,6 +47,9 @@ services:
       PROXY_URL: http://proxy:8080/webhook
       TG_SESSION: /data/tg_listener
       MESSAGES_FILE: /data/tg_messages.jsonl
+      LISTENER_LOG_FILE: /data/listener.log
+      LISTENER_HEARTBEAT_FILE: /data/listener_heartbeat.json
+      ALERTS_STATE_FILE: /data/alerts_listener.json
     depends_on:
       proxy:
         condition: service_healthy
@@ -62,6 +67,10 @@ services:
       PAPER_JOURNAL_FILE: /data/paper_trades.jsonl
       MESSAGES_FILE: /data/tg_messages.jsonl
       SYNC_CACHE_FILE: /data/sync_cache.json
+      PAPER_OUTCOMES_FILE: /data/paper_outcomes.jsonl
+      LISTENER_HEARTBEAT_FILE: /data/listener_heartbeat.json
+      SYNC_LOG_FILE: /data/sync.log
+      ALERTS_STATE_FILE: /data/alerts_sync.json
     depends_on:
       proxy:
         condition: service_healthy

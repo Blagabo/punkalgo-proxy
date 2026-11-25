@@ -17,6 +17,11 @@ Cómo casa las órdenes, en cada sincronización (como mucho una por segundo y s
 
 Cada operación cerrada se apunta en `PAPER_JOURNAL_FILE` (JSON por línea) con el PnL neto
 de comisiones y el resultado en R sobre el SL original.
+
+Trazabilidad para ajustar la gestión: mientras está abierta se guarda el mejor y el peor precio
+(MFE/MAE). Al cerrarse, la operación se sigue "en sombra" con los niveles de la señal hasta que
+toca el SL original, toca el último objetivo o pasan TRACK_HOURS: así se sabe hasta qué objetivo
+habría llegado aunque el bot saliera antes (BE, cierre manual). Resultado en `PAPER_OUTCOMES_FILE`.
 """
 
 from __future__ import annotations
@@ -48,7 +53,11 @@ class PaperExchange:
         self.s: dict[str, Any] = {
             "start_equity": float(cfg.paper_equity), "realized": 0.0, "fees": 0.0,
             "next_id": 1, "orders": {}, "positions": {}, "tps": {}, "leverage": {}, "seen": {},
+            "shadows": {},
         }
+        self.outcomes_path = Path(getattr(cfg, "paper_outcomes_file", "") or
+                                  self.journal_path.with_name("paper_outcomes.jsonl"))
+        self.track_hours = float(getattr(cfg, "track_hours", 72.0))
         self._load()
 
     # ---- persistencia ---------------------------------------------------------------
@@ -221,6 +230,8 @@ class PaperExchange:
             pos["sl"] = sl_price
             pos["tp"] = tp_price
             pos.setdefault("sl_initial", sl_price)
+            if tp_price and tp_price not in pos.setdefault("tp_prices", []):
+                pos["tp_prices"].append(tp_price)
             pos.setdefault("sl_order_id", self._id("PSL"))
             self._check_now(pos)
             self._save()
@@ -243,6 +254,9 @@ class PaperExchange:
             oid = self._id("PTP")
             self.s["tps"][oid] = {"id": oid, "orderId": oid, "positionId": str(position_id),
                                   "symbol": symbol, "tpPrice": tp_price, "tpQty": qty}
+            pos = self.s["positions"][str(position_id)]
+            if tp_price not in pos.setdefault("tp_prices", []):
+                pos["tp_prices"].append(tp_price)
             self._save()
             return {"orderId": oid}
 
@@ -275,7 +289,8 @@ class PaperExchange:
             return
         self._synced[symbol] = now
         active = (any(o["symbol"] == symbol and o["status"] == "NEW" for o in self.s["orders"].values())
-                  or any(p["symbol"] == symbol for p in self.s["positions"].values()))
+                  or any(p["symbol"] == symbol for p in self.s["positions"].values())
+                  or any(t["symbol"] == symbol for t in self.s.setdefault("shadows", {}).values()))
         if not active:
             return
         win = self._window(symbol)
@@ -299,8 +314,67 @@ class PaperExchange:
             if pos["symbol"] != symbol or pos.get("fill_window"):
                 continue                       # recién llena: su rango ya se usó para el fill
             pos["mark"] = last
+            self._excursion(pos, lo, hi)
             self._check_range(pos, lo, hi)
+        for cid, sh in list(self.s["shadows"].items()):
+            if sh["symbol"] == symbol:
+                self._follow(cid, sh, lo, hi)
         self._save()
+
+    # ---- trazabilidad: excursiones y seguimiento en sombra -----------------------------------
+    @staticmethod
+    def _excursion(rec: dict, lo: float, hi: float) -> None:
+        """Mejor y peor precio vistos (best/worst) según el lado."""
+        short = rec["side"] == "SHORT"
+        fav, adv = (lo, hi) if short else (hi, lo)
+        if rec.get("best") is None or (fav < rec["best"] if short else fav > rec["best"]):
+            rec["best"] = fav
+        if rec.get("worst") is None or (adv > rec["worst"] if short else adv < rec["worst"]):
+            rec["worst"] = adv
+
+    @staticmethod
+    def _reached(side: str, tps: list[float], best: float | None) -> int:
+        if best is None:
+            return 0
+        return sum(1 for t in tps if (best <= t if side == "SHORT" else best >= t))
+
+    def _follow(self, cid: str, sh: dict, lo: float, hi: float) -> None:
+        """Avanza el seguimiento en sombra: primero el SL original (conservador), luego objetivos."""
+        short = sh["side"] == "SHORT"
+        adverse = hi if short else lo
+        if adverse >= sh["sl"] if short else adverse <= sh["sl"]:
+            self._settle(cid, sh, "sl")
+            return
+        self._excursion(sh, lo, hi)
+        sh["reach_tp"] = max(sh["reach_tp"], self._reached(sh["side"], sh["tps"], sh.get("best")))
+        if sh["reach_tp"] >= len(sh["tps"]):
+            self._settle(cid, sh, "all_tps")
+        elif self._ms() - sh["closed_ms"] > self.track_hours * 3_600_000:
+            self._settle(cid, sh, "timeout")
+
+    def _settle(self, cid: str, sh: dict, state: str) -> None:
+        self.s["shadows"].pop(cid, None)
+        self._outcome(cid, sh, state)
+        self.log("PAPER", f"{sh['symbol']}: seguimiento terminado ({state}): llegó hasta el objetivo "
+                          f"{sh['reach_tp']}/{len(sh['tps'])} antes del SL original")
+
+    def _outcome(self, cid: str, sh: dict, state: str) -> None:
+        row = {"client_id": cid, "symbol": sh["symbol"], "side": sh["side"], "entry": sh["entry"],
+               "sl": sh["sl"], "tps": sh["tps"], "reach_tp": sh["reach_tp"], "best": sh.get("best"),
+               "state": state, "closed_ms": sh["closed_ms"], "ts": self._ms()}
+        with self.outcomes_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def track(self, every: float = 30.0) -> None:
+        """Sigue en sombra las operaciones cerradas (lo llama el monitor del proxy)."""
+        with self.lock:
+            now = self.clock()
+            for symbol in {sh["symbol"] for sh in self.s.get("shadows", {}).values()}:
+                if now - self._synced.get(symbol, 0.0) >= every:
+                    try:
+                        self.sync(symbol, force=True)
+                    except Exception as exc:       # sin red: se reintenta en la siguiente vuelta
+                        self.log("DEBUG", f"paper: seguimiento de {symbol} sin datos ({exc!r})")
 
     def _check_now(self, pos: dict) -> None:
         """Al colocar o mover el SL: si el precio ya lo ha cruzado, cierra al precio actual."""
@@ -368,7 +442,7 @@ class PaperExchange:
             "marginMode": "ISOLATION", "ctime": self._ms(), "mark": price, "sl": None, "tp": None,
             "fees": fee, "realized": 0.0, "fills": [{"kind": "ENTRY", "price": price, "qty": qty,
                                                      "fee": fee, "ts": self._ms()}],
-            "signal_entry": order["price"], "client_id": order["clientId"],
+            "signal_entry": order["price"], "client_id": order["clientId"], "best": price, "worst": price,
         }
         self.s["realized"] -= fee
         self.s["fees"] += fee
@@ -410,10 +484,23 @@ class PaperExchange:
             "close_reason": reason, "fills": pos["fills"], "fees": round(pos["fees"], 6),
             "pnl": round(pos["realized"] - entry_fee, 6),
             "r": round((pos["realized"] - entry_fee) / risk, 4) if risk else None,
+            "best": pos.get("best"), "worst": pos.get("worst"),
+            "tps": [float(t) for t in pos.get("tp_prices") or []],
         }
         # pos["realized"] no incluye la comisión de entrada; el PnL neto del journal sí
         with self.journal_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        cid = pos.get("client_id")
+        if cid and sl0 and row["tps"]:
+            tps = sorted(row["tps"], reverse=pos["side"] == "SHORT")   # del más cercano al más lejano
+            sh = {"symbol": pos["symbol"], "side": pos["side"], "entry": entry, "sl": sl0, "tps": tps,
+                  "best": pos.get("best"), "worst": pos.get("worst"), "closed_ms": row["closed_ms"],
+                  "reach_tp": self._reached(pos["side"], tps, pos.get("best"))}
+            if reason == "SL" or sh["reach_tp"] >= len(tps):
+                self._outcome(cid, sh, "sl" if reason == "SL" else "all_tps")
+            else:
+                self.s.setdefault("shadows", {})[cid] = sh
+                self._outcome(cid, sh, "tracking")
         self.log("PAPER", f"{pos['symbol']}: cerrada ({reason}) PnL {row['pnl']:+.4f} USDT"
                           + (f" = {row['r']:+.2f}R" if row["r"] is not None else ""))
 

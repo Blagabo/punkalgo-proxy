@@ -61,6 +61,9 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 
+from alerts import Alerts
+from logfile import append_line
+
 # --------------------------------------------------------------------------------------
 # Utilidades de entorno / configuración
 # --------------------------------------------------------------------------------------
@@ -143,6 +146,7 @@ class Config:
     max_price_deviation_pct: float = 5.0  # rechazo si la entrada está muy lejos del mercado (0 = off)
     daily_loss_limit_pct: float = 0.0    # freno: sin entradas nuevas si el equity cae este % en el día UTC (0 = off)
     max_open_risk_pct: float = 0.0       # tope de riesgo sumado hasta el SL de lo abierto, % del equity (0 = off)
+    drawdown_alert_pct: float = 5.0      # aviso a Discord si el equity cae este % desde su máximo (0 = off)
 
     # --- Orden de entrada --------------------------------------------------------------
     entry_order_type: str = "LIMIT"      # LIMIT | MARKET
@@ -188,6 +192,8 @@ class Config:
     paper_slippage_pct: float = 0.02     # en contra, en entradas a mercado, SL y TP
     paper_state_file: str = "paper_state.json"
     paper_journal_file: str = "paper_trades.jsonl"
+    paper_outcomes_file: str = "paper_outcomes.jsonl"   # seguimiento en sombra tras el cierre
+    track_hours: float = 72.0
 
 
 CFG = Config(
@@ -213,6 +219,7 @@ CFG = Config(
     max_price_deviation_pct=f("MAX_PRICE_DEVIATION_PCT", 5.0),
     daily_loss_limit_pct=f("DAILY_LOSS_LIMIT_PCT", 0.0),
     max_open_risk_pct=f("MAX_OPEN_RISK_PCT", 0.0),
+    drawdown_alert_pct=f("DRAWDOWN_ALERT_PCT", 5.0),
     entry_order_type=s("ENTRY_ORDER_TYPE", "LIMIT").upper(),
     entry_time_in_force=s("ENTRY_TIME_IN_FORCE", "GTC").upper(),
     limit_order_ttl_sec=i("LIMIT_ORDER_TTL_SEC", 900),
@@ -248,6 +255,8 @@ CFG = Config(
     paper_slippage_pct=f("PAPER_SLIPPAGE_PCT", 0.02),
     paper_state_file=s("PAPER_STATE_FILE", "paper_state.json"),
     paper_journal_file=s("PAPER_JOURNAL_FILE", "paper_trades.jsonl"),
+    paper_outcomes_file=s("PAPER_OUTCOMES_FILE", "paper_outcomes.jsonl"),
+    track_hours=f("TRACK_HOURS", 72.0),
 )
 
 if CFG.broker not in ("bitunix", "paper"):
@@ -268,13 +277,15 @@ LOG_PATH = Path(CFG.log_file)
 if not LOG_PATH.is_absolute():
     LOG_PATH = SCRIPT_DIR / LOG_PATH
 _LOG_LOCK = threading.Lock()
+_ALERTS_PATH = Path(s("ALERTS_STATE_FILE", "alerts_proxy.json"))
+ALERTS = Alerts("proxy", state_path=_ALERTS_PATH if _ALERTS_PATH.is_absolute() else SCRIPT_DIR / _ALERTS_PATH)
 
 # Anillo de eventos en memoria: cola de logs que sirve GET /events.
 EVENTS: deque[dict] = deque(maxlen=i("EVENT_BUFFER", 400))
 _EVENT_IDS = count(1)
 
 
-def log(level: str, msg: str) -> None:
+def log(level: str, msg: str, notify: bool = True) -> None:
     if LOG_LEVELS.get(level, 20) < LOG_LEVELS.get(CFG.log_level, 20):
         return
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -283,11 +294,9 @@ def log(level: str, msg: str) -> None:
         EVENTS.append({"id": next(_EVENT_IDS), "ts": time.time(), "utc": stamp,
                        "level": level, "msg": msg})
         print(line, flush=True)
-        try:
-            with LOG_PATH.open("a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
-        except OSError:
-            pass
+        append_line(LOG_PATH, line, max_bytes=10_000_000)   # rota a proxy.log.1
+    if level == "ERROR" and notify:
+        ALERTS.error_log(msg)                                # Discord, con anti-spam
 
 
 # --------------------------------------------------------------------------------------
@@ -937,6 +946,7 @@ def _local(path: str) -> Path:
 
 
 if CFG.broker == "paper":
+    CFG.paper_outcomes_file = str(_local(CFG.paper_outcomes_file))
     from paper import PaperExchange
     EX = PaperExchange(CFG, EX, _local(CFG.paper_state_file), _local(CFG.paper_journal_file),
                        log=lambda level, msg: log(level, msg), error_cls=BitunixError)
@@ -1141,6 +1151,11 @@ def note_day_equity(equity: float | None) -> None:
     log("WARNING", f"FRENO DIARIO: el equity cae {loss_pct:.2f}% hoy ({start:.2f} -> {equity:.2f} USDT, "
                    f"límite {CFG.daily_loss_limit_pct:g}%). Sin entradas nuevas hasta mañana (UTC); "
                    f"lo abierto se sigue gestionando")
+    ALERTS.alert(f"daily_brake:{day_key()}", "Freno diario activado",
+                 f"El equity ha caído un {loss_pct:.2f}% hoy (límite {CFG.daily_loss_limit_pct:g}%). "
+                 f"No se abren señales nuevas hasta mañana (UTC); lo abierto se sigue gestionando.",
+                 level="critical", cooldown=86400,
+                 fields={"Inicio del día": f"{start:.2f} USDT", "Ahora": f"{equity:.2f} USDT", "Broker": CFG.broker})
 
 
 def trade_risk(rec: dict) -> float:
@@ -1382,7 +1397,11 @@ def ensure_position_sl(rec: dict) -> None:
         res = EX.place_position_tp_sl(rec["symbol"], str(rec["position_id"]), sl_price, tp_price)
     except BitunixError as exc:
         log("ERROR", f"{rec['symbol']}: !! el SL de posición NO se colocó ({exc.msg}); "
-                     f"reintento en el próximo tick")
+                     f"reintento en el próximo tick", notify=False)
+        ALERTS.alert(f"sl_missing:{rec['symbol']}", f"{rec['symbol']}: posición SIN stop loss",
+                     f"El exchange rechazó el SL ({exc.msg}). El bot lo reintenta cada pocos segundos; "
+                     f"si sigue, ciérrala desde la web o el exchange.", level="critical", cooldown=600,
+                     fields={"Lado": rec["side"], "SL": sl_price, "Broker": CFG.broker})
         return
     order_id = str(res.get("orderId") or "")
     STATE.update(rec["id"], sl_order_id=order_id)
@@ -1722,7 +1741,29 @@ def monitor_once() -> None:
         except Exception as exc:                        # nunca tumbar el hilo del monitor
             STATE.bump("errors")
             log("ERROR", f"monitor inesperado: {exc!r}")
+    if hasattr(EX, "track"):                         # paper: seguimiento en sombra de lo cerrado
+        try:
+            EX.track()
+        except Exception as exc:
+            log("ERROR", f"seguimiento en sombra: {exc!r}")
     STATE.prune()
+
+
+def watch_drawdown(equity: float | None) -> None:
+    """Avisa si el equity cae DRAWDOWN_ALERT_PCT desde su máximo (y cuando se recupera)."""
+    if not equity or CFG.drawdown_alert_pct <= 0:
+        return
+    with STATE.lock:
+        peak = max(float(STATE.counters.get("equity_peak") or 0), float(equity))
+        STATE.counters["equity_peak"] = peak
+    dd = (peak - equity) / peak * 100 if peak else 0.0
+    if dd >= CFG.drawdown_alert_pct:
+        ALERTS.alert("drawdown", f"Drawdown del {dd:.1f}% desde el máximo",
+                     f"El equity está en {equity:.2f} USDT; el máximo fue {peak:.2f} USDT. "
+                     f"Revisa si conviene activar los frenos o pausar.",
+                     level="warning", cooldown=86400, fields={"Broker": CFG.broker})
+    elif dd < CFG.drawdown_alert_pct / 2:
+        ALERTS.resolve("drawdown", "Drawdown recuperado", f"El equity vuelve a {equity:.2f} USDT ({dd:.1f}% bajo el máximo).")
 
 
 def sample_metrics(force: bool = False) -> None:
@@ -1736,6 +1777,7 @@ def sample_metrics(force: bool = False) -> None:
         if error is None:
             _SAMPLE.update(equity=equity, available=available, eq_ts=ts)
             note_day_equity(equity)
+            watch_drawdown(equity)
     _SAMPLE["ts"] = ts
     STATE.sample(ts, _SAMPLE["equity"], _SAMPLE["available"], committed_margin(), len(STATE.active()))
 

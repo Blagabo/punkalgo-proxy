@@ -12,3 +12,8 @@ paper_state.json
 paper_trades.jsonl
 tg_messages.jsonl
 runtime.json
+paper_outcomes.jsonl
+listener.log*
+listener_heartbeat.json
+sync.log*
+alerts_*.json

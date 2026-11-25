@@ -12,3 +12,9 @@ tg_messages.jsonl
 *.session-journal
 data/
 runtime.json
+paper_outcomes.jsonl
+listener.log*
+listener_heartbeat.json
+sync.log*
+proxy.log.1
+alerts_*.json
