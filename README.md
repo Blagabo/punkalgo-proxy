@@ -93,6 +93,38 @@ actual). Solo lee los archivos de `/data` y el `/status` del proxy, y solo enví
 cambian. Usa la clave secreta de Supabase, que no sale del `.env` del VPS. Con
 `COMPOSE_PROFILES=listener,sync` en el `.env`, `docker compose up -d` lo arranca todo.
 
+## Trazabilidad
+
+Todo queda en `./data` (sobrevive a reinicios y redespliegues; `docker compose logs` no):
+
+| Archivo | Qué guarda |
+| --- | --- |
+| `proxy.log`, `listener.log`, `sync.log` | logs de cada proceso (rotan a `.1` al pasar de 5–10 MB) |
+| `tg_messages.jsonl` | cada mensaje del canal: tipo, retraso (`delay_s`), si llegó por aviso o por sondeo (`source`), qué hizo el bot |
+| `listener_heartbeat.json` | latido del listener: conectado, último mensaje, mensajes recuperados por sondeo y con retraso |
+| `paper_trades.jsonl` | cada operación cerrada: fills, comisiones, PnL, R, mejor y peor precio (MFE/MAE), objetivos |
+| `paper_outcomes.jsonl` | seguimiento en sombra tras el cierre: hasta qué objetivo llegó antes del SL original |
+
+El listener, además de los avisos de Telegram, revisa cada `POLL_SEC` los últimos mensajes del
+canal y procesa los que no le llegaron. Las señales se aceptan hasta `SIGNAL_MAX_AGE_SEC`
+(30 min por defecto): la entrada límite caduca sola y `MAX_PRICE_DEVIATION_PCT` descarta las
+que ya se alejaron del precio.
+
+## Avisos a Discord
+
+Con `DISCORD_WEBHOOK_URL` en el `.env`, el bot avisa **sólo de lo que pide atención** (nunca de
+aperturas o cierres normales), con anti-spam: la misma alerta no se repite en 30–60 min (las
+repeticiones se cuentan), los errores pasajeros de red sólo avisan si se repiten, y llega un
+aviso verde cuando el problema se resuelve.
+
+| Quién | Avisa de |
+| --- | --- |
+| proxy | cualquier error; posición **sin stop loss**; freno diario activado; drawdown ≥ `DRAWDOWN_ALERT_PCT` desde el máximo |
+| listener | sesión de Telegram caducada; señal **no entregada** al proxy; señal rechazada por un problema (no por los frenos); señales con > 5 min de retraso |
+| sync (vigilante) | proxy sin responder > 2 min; listener sin latido > 6 min; la web sin actualizarse > 5 min |
+
+Prueba: `docker compose run --rm sync python alerts.py test`.
+
 ## Frenos y cierre manual
 
 * `DAILY_LOSS_LIMIT_PCT`: si el equity (flotante incluido) cae ese % desde el inicio del día
@@ -246,6 +278,8 @@ python3 test_paper.py      # modo paper: fills, mechas, TP, BE, SL conservador, 
 python3 test_classify.py   # tipos de mensaje del canal
 python3 test_sync.py       # filas que se mandan a Supabase
 python3 test_guards.py     # freno diario, tope de riesgo abierto y cierres manuales
+python3 test_trace.py      # MFE/MAE y seguimiento en sombra tras el cierre
+python3 test_alerts.py     # avisos: anti-spam, errores pasajeros, vigilante
 bash test_webhook.sh       # levanta el servidor en DRY_RUN y dispara 5 requests
 ./proxy parse signals/sample.txt
 ./proxy status

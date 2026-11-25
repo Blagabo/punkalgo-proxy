@@ -23,6 +23,7 @@ os.environ.update({
     "STATE_FILE": str(TMP / "state.json"), "LOG_FILE": str(TMP / "proxy.log"),
     "PAPER_STATE_FILE": str(TMP / "paper.json"), "PAPER_JOURNAL_FILE": str(TMP / "journal.jsonl"),
     "RUNTIME_FILE": str(TMP / "runtime.json"),
+    "PAPER_OUTCOMES_FILE": str(TMP / "outcomes.jsonl"),
     "PAPER_EQUITY": "1000", "SIZING_MODE": "risk", "RISK_PCT": "0.5",
     "PAPER_SLIPPAGE_PCT": "0", "PAPER_TAKER_FEE_PCT": "0.06", "PAPER_MAKER_FEE_PCT": "0.02",
     "MAX_PRICE_DEVIATION_PCT": "0", "MAX_OPEN_POSITIONS": "10", "MAX_TOTAL_MARGIN_PCT": "0",
