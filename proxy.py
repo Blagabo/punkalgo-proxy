@@ -141,6 +141,8 @@ class Config:
     max_open_positions: int = 5
     allow_reverse: bool = False          # permitir abrir en contra de una posición abierta
     max_price_deviation_pct: float = 5.0  # rechazo si la entrada está muy lejos del mercado (0 = off)
+    daily_loss_limit_pct: float = 0.0    # freno: sin entradas nuevas si el equity cae este % en el día UTC (0 = off)
+    max_open_risk_pct: float = 0.0       # tope de riesgo sumado hasta el SL de lo abierto, % del equity (0 = off)
 
     # --- Orden de entrada --------------------------------------------------------------
     entry_order_type: str = "LIMIT"      # LIMIT | MARKET
@@ -209,6 +211,8 @@ CFG = Config(
     max_open_positions=i("MAX_OPEN_POSITIONS", 5),
     allow_reverse=b("ALLOW_REVERSE", False),
     max_price_deviation_pct=f("MAX_PRICE_DEVIATION_PCT", 5.0),
+    daily_loss_limit_pct=f("DAILY_LOSS_LIMIT_PCT", 0.0),
+    max_open_risk_pct=f("MAX_OPEN_RISK_PCT", 0.0),
     entry_order_type=s("ENTRY_ORDER_TYPE", "LIMIT").upper(),
     entry_time_in_force=s("ENTRY_TIME_IN_FORCE", "GTC").upper(),
     limit_order_ttl_sec=i("LIMIT_ORDER_TTL_SEC", 900),
@@ -766,6 +770,11 @@ class Bitunix:
         return self._call("POST", "/api/v1/futures/tpsl/cancel_order", mutating=True,
                           body={"symbol": symbol, "orderId": str(order_id)})
 
+    def close_position(self, symbol: str, position_id: str) -> Any:
+        """Cierra a mercado toda la posición (flash close). Sólo la posición indicada."""
+        return self._call("POST", "/api/v1/futures/trade/flash_close_position", mutating=True,
+                          body={"positionId": str(position_id)})
+
 
 # --------------------------------------------------------------------------------------
 # Estado persistente (sobrevive reinicios)
@@ -1089,6 +1098,77 @@ def be_price(side: str, entry: float, places: int) -> str:
 # --------------------------------------------------------------------------------------
 
 
+def day_key(ts: float | None = None) -> str:
+    return datetime.fromtimestamp(time.time() if ts is None else ts, timezone.utc).strftime("%Y-%m-%d")
+
+
+def note_day_equity(equity: float | None) -> None:
+    """Fija el equity de inicio del día UTC y dispara el freno diario si la caída llega al límite.
+
+    Se llama con cada muestra de cuenta, así el freno salta aunque no entre ninguna señal.
+    El equity incluye lo flotante: una posición de ayer que pierde hoy cuenta para hoy.
+    """
+    if equity is None or equity <= 0:
+        return
+    with STATE.lock:
+        row = STATE.daily.setdefault(day_key(), {})
+        start = row.setdefault("start_equity", round(float(equity), 4))
+        if CFG.daily_loss_limit_pct <= 0 or row.get("halted"):
+            return
+        loss_pct = (start - equity) / start * 100 if start else 0.0
+        if loss_pct < CFG.daily_loss_limit_pct:
+            return
+        row["halted"] = time.time()
+    STATE.save()
+    log("WARNING", f"FRENO DIARIO: el equity cae {loss_pct:.2f}% hoy ({start:.2f} -> {equity:.2f} USDT, "
+                   f"límite {CFG.daily_loss_limit_pct:g}%). Sin entradas nuevas hasta mañana (UTC); "
+                   f"lo abierto se sigue gestionando")
+
+
+def trade_risk(rec: dict) -> float:
+    """USDT que se pierden si salta el SL vigente (el de break-even si ya se movió)."""
+    try:
+        entry = float(rec.get("entry_price") or 0)
+        stop = float(rec.get("be_price") if rec.get("be_done") and rec.get("be_price") else rec.get("sl") or 0)
+        qty = float(rec.get("filled") if float(rec.get("filled") or 0) > 0 else rec.get("qty") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    loss = (stop - entry) if rec.get("side") == "LONG" else (entry - stop)
+    return max(0.0, -loss) * qty
+
+
+def open_risk() -> float:
+    return sum(trade_risk(rec) for rec in STATE.active())
+
+
+def guards_payload(equity: float | None) -> dict:
+    row = STATE.daily.get(day_key(), {})
+    start = row.get("start_equity")
+    risk = open_risk()
+    return {
+        "daily_loss_limit_pct": CFG.daily_loss_limit_pct, "max_open_risk_pct": CFG.max_open_risk_pct,
+        "day_start_equity": start, "halted": bool(row.get("halted")),
+        "day_change_pct": round((equity - start) / start * 100, 3) if equity and start else None,
+        "open_risk": round(risk, 4),
+        "open_risk_pct": round(risk / equity * 100, 3) if equity else None,
+    }
+
+
+def risk_guard(plan: dict, sig: Signal) -> str | None:
+    """Motivo para no abrir la señal (freno diario o tope de riesgo abierto), o None."""
+    equity = float(plan.get("equity") or 0)
+    note_day_equity(equity)
+    if STATE.daily.get(day_key(), {}).get("halted"):
+        return f"freno diario activo (pérdida del día ≥ {CFG.daily_loss_limit_pct:g}% del equity)"
+    if CFG.max_open_risk_pct > 0 and equity > 0:
+        new = abs(float(plan["entry"]) - float(plan["sl"])) * float(plan["qty"])
+        used = open_risk()
+        if (used + new) / equity * 100 > CFG.max_open_risk_pct:
+            return (f"riesgo abierto {used + new:.2f} USDT ({(used + new) / equity * 100:.2f}%) pasaría del "
+                    f"tope de {CFG.max_open_risk_pct:g}% del equity")
+    return None
+
+
 def committed_margin() -> float:
     """Margen ya comprometido por las operaciones que estamos gestionando."""
     total = 0.0
@@ -1135,6 +1215,11 @@ def handle_signal(payload: Any, origin: str = "webhook") -> dict:
     except (SignalError, BitunixError) as exc:
         log("ERROR", f"plan inválido para {sig.symbol}: {exc}")
         return {"ok": False, "error": f"plan inválido: {exc}", "signal": sig.brief()}
+
+    blocked = risk_guard(plan, sig)
+    if blocked:
+        log("WARNING", f"{sig.symbol}: {blocked}; señal descartada")
+        return {"ok": False, "error": blocked, "signal": sig.brief()}
 
     used = committed_margin()
     if CFG.max_total_margin_pct > 0 and plan["equity"] > 0:
@@ -1632,6 +1717,7 @@ def sample_metrics(force: bool = False) -> None:
         equity, available, error = account_snapshot()
         if error is None:
             _SAMPLE.update(equity=equity, available=available, eq_ts=ts)
+            note_day_equity(equity)
     _SAMPLE["ts"] = ts
     STATE.sample(ts, _SAMPLE["equity"], _SAMPLE["available"], committed_margin(), len(STATE.active()))
 
@@ -1755,8 +1841,10 @@ def status_payload() -> dict:
             "max_open_positions": CFG.max_open_positions,
             "dedupe_window_sec": CFG.dedupe_window_sec,
             "dry_run": CFG.dry_run, "broker": CFG.broker, "risk_pct": CFG.risk_pct,
+            "daily_loss_limit_pct": CFG.daily_loss_limit_pct, "max_open_risk_pct": CFG.max_open_risk_pct,
         },
         "margin_in_use": round(committed_margin(), 4),
+        "guards": guards_payload(equity),
         "counters": STATE.counts(), "lasts": STATE.lasts(), "samples": len(STATE.metrics),
         "uptime_sec": round(time.time() - START_TS),
         "managed": STATE.active(), "recent": STATE.positions[-15:],
@@ -1792,6 +1880,44 @@ def cancel_action(payload: dict) -> tuple[int, dict]:
     return 404, {"ok": False, "error": f"{wanted} no está entre las operaciones activas"}
 
 
+def close_one(rec: dict, origin: str) -> dict:
+    """Cierra una operación gestionada: cancela la entrada si no se llenó, o cierra la posición a mercado."""
+    symbol = rec["symbol"]
+    if rec["status"] == "WAITING_FILL":
+        EX.cancel_order(symbol, order_id=rec.get("order_id"), client_id=rec["id"])
+        STATE.update(rec["id"], status="CANCELLED", note=f"entrada cancelada a mano ({origin})")
+        log("INFO", f"{symbol}: entrada cancelada a mano ({origin})")
+        return {"id": rec["id"], "symbol": symbol, "action": "cancelled"}
+    if not rec.get("position_id"):
+        raise BitunixError("no_position", "la operación no tiene posición enlazada", "close")
+    EX.close_position(symbol, str(rec["position_id"]))
+    cancel_leftover_tp(rec)
+    mark_closed(rec, f"cierre manual ({origin})")
+    return {"id": rec["id"], "symbol": symbol, "action": "closed"}
+
+
+def close_action(payload: dict, origin: str = "api") -> tuple[int, dict]:
+    """Cierra una operación (id o symbol) o todas ({"all": true}). Sólo toca lo que gestiona el bot."""
+    everything = bool(payload.get("all"))
+    wanted = str(payload.get("id") or payload.get("symbol") or "").strip().upper()
+    if not everything and not wanted:
+        return 400, {"ok": False, "error": "falta id, symbol o all"}
+    targets = [r for r in STATE.active()
+               if everything or wanted in (str(r.get("id")).upper(), str(r.get("symbol")).upper())]
+    if not targets:
+        return 404, {"ok": False, "error": "no hay operaciones activas que cerrar" if everything
+                     else f"{wanted} no está entre las operaciones activas"}
+    done, failed = [], []
+    for rec in targets:
+        try:
+            done.append(close_one(rec, origin))
+        except BitunixError as exc:
+            failed.append({"id": rec["id"], "symbol": rec["symbol"], "error": exc.msg})
+            log("ERROR", f"{rec['symbol']}: no se pudo cerrar a mano: {exc}")
+    status = 200 if not failed else (207 if done else 502)
+    return status, {"ok": not failed, "done": done, "failed": failed}
+
+
 def http_dispatch(method: str, path: str, headers: dict, query: dict, body: str,
                   remote: str = "?", token: str | None = None) -> tuple[int, Any, str]:
     """Una sola tabla de rutas para Flask y para el servidor de la librería estándar."""
@@ -1809,6 +1935,18 @@ def http_dispatch(method: str, path: str, headers: dict, query: dict, body: str,
             except json.JSONDecodeError:
                 return 400, {"ok": False, "error": "body json inválido"}, "application/json"
             status, reply = cancel_action(payload if isinstance(payload, dict) else {})
+            return status, reply, "application/json"
+        if path in ("/api/close", "/api/close-all"):
+            if not authorize(None, headers, query, body):
+                return 401, {"ok": False, "error": "no autorizado"}, "application/json"
+            try:
+                payload = json.loads(body or "{}")
+            except json.JSONDecodeError:
+                return 400, {"ok": False, "error": "body json inválido"}, "application/json"
+            payload = payload if isinstance(payload, dict) else {}
+            if path == "/api/close-all":
+                payload = {"all": True}
+            status, reply = close_action(payload, origin=str(payload.get("origin") or "api")[:20])
             return status, reply, "application/json"
         return 404, {"ok": False, "error": f"ruta {path} inexistente"}, "application/json"
 
@@ -2061,8 +2199,8 @@ def selftest() -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="proxy: webhook de señales -> Bitunix futures")
     parser.add_argument("command", nargs="?", default="serve",
-                        choices=["serve", "selftest", "parse", "status", "config"])
-    parser.add_argument("arg", nargs="?", help="archivo con la señal (para 'parse')")
+                        choices=["serve", "selftest", "parse", "status", "config", "close", "close-all"])
+    parser.add_argument("arg", nargs="?", help="archivo con la señal ('parse') o par / id ('close')")
     parser.add_argument("--dry-run", action="store_true", help="no envía órdenes reales")
     parser.add_argument("--port", type=int, help="puerto del servidor")
     args = parser.parse_args(argv)
@@ -2083,10 +2221,21 @@ def main(argv: list[str]) -> int:
                           "api_secret": "***" if CFG.api_secret else ""},
                          ensure_ascii=False, indent=2))
         return 0
+    local = f"http://127.0.0.1:{CFG.port}"
+    auth = {"X-Webhook-Token": CFG.webhook_token}
     if args.command == "status":
-        print(json.dumps(requests.get(f"http://127.0.0.1:{CFG.port}/status", timeout=15).json(),
+        print(json.dumps(requests.get(f"{local}/status", headers=auth, timeout=15).json(),
                          ensure_ascii=False, indent=2))
         return 0
+    if args.command in ("close", "close-all"):
+        # Va contra el servidor en marcha: es él quien tiene el estado y el exchange.
+        if args.command == "close" and not args.arg:
+            parser.error("close necesita el par (NEARUSDT) o el id de la operación")
+        path, body = (("/api/close-all", {"origin": "cli"}) if args.command == "close-all"
+                      else ("/api/close", {"symbol": args.arg, "origin": "cli"}))
+        resp = requests.post(f"{local}{path}", json=body, headers=auth, timeout=60)
+        print(json.dumps(resp.json(), ensure_ascii=False, indent=2))
+        return 0 if resp.ok else 1
     run_server()
     return 0
 

@@ -10,9 +10,14 @@ de Supabase, que nunca sale del VPS. Solo envía las filas que han cambiado.
     python sync.py          # bucle (servicio `sync` del compose)
     python sync.py once     # una pasada y sale
 
+Además ejecuta las órdenes que la web deja en `bot_commands` (cerrar una operación o todas):
+las mira cada COMMAND_POLL_SEC, las pasa al proxy (/api/close, /api/close-all) y apunta el
+resultado. Una orden con más de COMMAND_MAX_AGE_SEC sin ejecutar se descarta.
+
 Variables: SUPABASE_URL, SUPABASE_SECRET_KEY, BOT_OWNER_ID (tu user id de Supabase),
-BOT_NAME, SYNC_INTERVAL_SEC, EQUITY_EVERY_SEC, PROXY_STATUS_URL, WEBHOOK_TOKEN y las rutas
-STATE_FILE, PAPER_STATE_FILE, PAPER_JOURNAL_FILE, MESSAGES_FILE.
+BOT_NAME, SYNC_INTERVAL_SEC, EQUITY_EVERY_SEC, COMMAND_POLL_SEC, COMMAND_MAX_AGE_SEC,
+PROXY_STATUS_URL, WEBHOOK_TOKEN y las rutas STATE_FILE, PAPER_STATE_FILE,
+PAPER_JOURNAL_FILE, MESSAGES_FILE.
 """
 
 from __future__ import annotations
@@ -62,6 +67,8 @@ OWNER = env("BOT_OWNER_ID")
 BOT = env("BOT_NAME", "punkchainer")
 INTERVAL = float(env("SYNC_INTERVAL_SEC", "30"))
 EQUITY_EVERY = float(env("EQUITY_EVERY_SEC", "300"))
+COMMAND_POLL = float(env("COMMAND_POLL_SEC", "5"))
+COMMAND_MAX_AGE = float(env("COMMAND_MAX_AGE_SEC", "600"))
 STATUS_URL = env("PROXY_STATUS_URL",
                  f"http://127.0.0.1:{env('PROXY_PORT', '8080')}/status")
 TOKEN = env("WEBHOOK_TOKEN")
@@ -163,6 +170,8 @@ def trade_status(rec: dict, closed: bool) -> str | None:
             return "closed"
         note = str(rec.get("note") or "").lower()
         return "expired" if ("ttl" in note or "sin fill" in note) else "cancelled"
+    if status == "CANCELLED":                 # entrada cancelada a mano (/api/cancel o /api/close)
+        return "cancelled"
     return None                               # DRY_RUN y similares no se publican
 
 
@@ -320,13 +329,71 @@ class Sync:
                 "user_id": OWNER, "bot": BOT, "updated_at": iso(now), "broker": cfg.get("broker"),
                 "equity": st.get("equity"), "available": st.get("available"),
                 "start_equity": paper.get("start_equity"), "active": len(st.get("managed") or []),
-                "config": cfg, "counters": st.get("counters"),
+                "config": {**cfg, "guards": st.get("guards")}, "counters": st.get("counters"),
             }], "user_id,bot")
             if st.get("equity") is not None and now - self.last_equity >= EQUITY_EVERY:
                 upsert("bot_equity", [{"user_id": OWNER, "bot": BOT, "ts": iso(int(now // 60 * 60)),
                                        "equity": st["equity"]}], "user_id,bot,ts")
                 self.last_equity = now
         return f"mensajes {n_msg} · operaciones {n_trd} · proxy {'ok' if st else 'sin respuesta'}"
+
+
+def proxy_base() -> str:
+    return STATUS_URL.rsplit("/status", 1)[0]
+
+
+def run_command(cmd: dict) -> tuple[str, str]:
+    """Pasa una orden de la web al proxy. Devuelve (estado, resultado legible)."""
+    action, target = cmd.get("action"), (cmd.get("target") or "").strip()
+    if action == "close_all":
+        path, body = "/api/close-all", {"origin": "web"}
+    elif action == "close" and target:
+        path, body = "/api/close", {"id": target, "origin": "web"}
+    else:
+        return "failed", "orden no válida"
+    try:
+        resp = requests.post(f"{proxy_base()}{path}", json=body, headers={"X-Webhook-Token": TOKEN}, timeout=60)
+        data = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        return "failed", f"proxy sin respuesta: {exc}"
+    done = ", ".join(f"{d['symbol']} {'cerrada' if d['action'] == 'closed' else 'cancelada'}" for d in data.get("done") or [])
+    failed = ", ".join(f"{f['symbol']}: {f['error']}" for f in data.get("failed") or [])
+    text = "; ".join(x for x in (done, failed and f"falló {failed}", data.get("error")) if x) or "sin cambios"
+    return ("done" if data.get("ok") else "failed"), text[:500]
+
+
+def pending_commands() -> list[dict]:
+    resp = requests.get(f"{URL}/rest/v1/bot_commands", headers=headers(), timeout=20, params={
+        "select": "id,action,target,created_at", "user_id": f"eq.{OWNER}", "bot": f"eq.{BOT}",
+        "status": "eq.pending", "order": "created_at.asc", "limit": "20"})
+    if resp.status_code == 404 or "PGRST205" in resp.text or "does not exist" in resp.text:
+        return []                             # migración 0008 aún sin aplicar
+    if resp.status_code >= 300:
+        raise RuntimeError(f"bot_commands: HTTP {resp.status_code} {resp.text[:200]}")
+    return resp.json()
+
+
+def finish_command(cmd_id: str, status: str, result: str) -> None:
+    resp = requests.patch(f"{URL}/rest/v1/bot_commands", headers=headers(), timeout=20,
+                          params={"id": f"eq.{cmd_id}", "user_id": f"eq.{OWNER}"},
+                          data=json.dumps({"status": status, "result": result, "done_at": iso(time.time())}))
+    if resp.status_code >= 300:
+        raise RuntimeError(f"bot_commands: HTTP {resp.status_code} {resp.text[:200]}")
+
+
+def commands() -> int:
+    """Ejecuta las órdenes pendientes de la web. Devuelve cuántas ha tratado."""
+    n = 0
+    for cmd in pending_commands():
+        age = time.time() - datetime.fromisoformat(cmd["created_at"].replace("Z", "+00:00")).timestamp()
+        if age > COMMAND_MAX_AGE:
+            status, result = "failed", f"caducada: llevaba {age / 60:.0f} min sin ejecutarse"
+        else:
+            status, result = run_command(cmd)
+        finish_command(cmd["id"], status, result)
+        log(f"orden web {cmd['action']} {cmd.get('target') or ''}: {status} · {result}")
+        n += 1
+    return n
 
 
 def main(argv: list[str]) -> int:
@@ -337,17 +404,24 @@ def main(argv: list[str]) -> int:
     if len(argv) > 1 and argv[1] == "once":
         log(sync.once())
         return 0
-    log(f"sincronizando «{BOT}» con {URL} cada {INTERVAL:g}s")
-    last_note = ""
+    log(f"sincronizando «{BOT}» con {URL} cada {INTERVAL:g}s (órdenes de la web cada {COMMAND_POLL:g}s)")
+    last_note, next_sync = "", 0.0
     while True:
         try:
-            note = sync.once()
-            if note != last_note:            # sin cambios no llena el log
-                log(note)
-            last_note = note
-        except Exception as exc:              # sin red o Supabase caído: reintenta en la próxima
-            log(f"error: {exc}")
-        time.sleep(INTERVAL)
+            if commands():                    # tras cerrar algo, la web lo ve en la siguiente vuelta
+                next_sync = 0.0
+        except Exception as exc:
+            log(f"error con las órdenes de la web: {exc}")
+        if time.time() >= next_sync:
+            try:
+                note = sync.once()
+                if note != last_note:        # sin cambios no llena el log
+                    log(note)
+                last_note = note
+            except Exception as exc:          # sin red o Supabase caído: reintenta en la próxima
+                log(f"error: {exc}")
+            next_sync = time.time() + INTERVAL
+        time.sleep(COMMAND_POLL)
 
 
 if __name__ == "__main__":
