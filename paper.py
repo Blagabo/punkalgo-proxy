@@ -246,6 +246,18 @@ class PaperExchange:
             self._save()
             return {"orderId": oid}
 
+    def close_position(self, symbol: str, position_id: str) -> Any:
+        """Cierre manual a mercado de lo que quede (taker, slippage en contra)."""
+        with self.lock:
+            pos = self.s["positions"].get(str(position_id))
+            if not pos:
+                self._missing(position_id)
+            last = self.market.last_price(symbol) or float(pos.get("mark") or pos["avgOpenPrice"])
+            self._close_qty(pos, float(pos["qty"]), self._slip(float(last), "BUY" if pos["side"] == "SHORT" else "SELL"),
+                            "MANUAL")
+            self._save()
+            return {"positionId": position_id}
+
     def cancel_tp_sl(self, symbol: str, order_id: str) -> Any:
         with self.lock:
             self.s["tps"].pop(str(order_id), None)

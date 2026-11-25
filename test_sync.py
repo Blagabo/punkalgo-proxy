@@ -113,6 +113,49 @@ def main() -> int:
     checks.append((a["tps"] == [2.836] and a["notional"] == 240.5 and a["msg_id"] == 742 and a["be_done"]
                    and m["trade_id"] == "pxA", "podada del estado y tras reinicio: conserva TPs, notional, BE y enlace"))
 
+    # órdenes de la web: requests falso (Supabase + proxy)
+    class Resp:
+        def __init__(self, code, data):
+            self.status_code, self._data, self.text, self.ok = code, data, json.dumps(data), code < 300
+        def json(self):
+            return self._data
+
+    import time as _t
+    now = _t.time()
+    calls = []
+    cmds = [{"id": "c1", "action": "close", "target": "pxB", "created_at": sync.iso(now - 5)},
+            {"id": "c2", "action": "close_all", "target": None, "created_at": sync.iso(now - 3600)}]
+
+    class FakeRequests:
+        RequestException = Exception
+        @staticmethod
+        def get(url, **kw):
+            calls.append(("get", url, kw.get("params")))
+            return Resp(200, cmds)
+        @staticmethod
+        def post(url, **kw):
+            calls.append(("post", url, kw.get("json"), kw.get("headers")))
+            return Resp(200, {"ok": True, "done": [{"symbol": "APTUSDT", "action": "closed"}], "failed": []})
+        @staticmethod
+        def patch(url, **kw):
+            calls.append(("patch", kw["params"]["id"].removeprefix("eq."), json.loads(kw["data"])))
+            return Resp(204, {})
+
+    real = sync.requests
+    sync.requests = FakeRequests
+    try:
+        n = sync.commands()
+    finally:
+        sync.requests = real
+    posts = [c for c in calls if c[0] == "post"]
+    patches = {c[1]: c[2] for c in calls if c[0] == "patch"}
+    checks.append((n == 2 and len(posts) == 1 and posts[0][1].endswith("/api/close") and posts[0][2]["id"] == "pxB"
+                   and posts[0][3]["X-Webhook-Token"] == sync.TOKEN, "orden 'close' pasada al proxy con id y token"))
+    checks.append((patches.get("c1", {}).get("status") == "done" and "APTUSDT cerrada" in patches["c1"]["result"],
+                   f"resultado apuntado: {patches.get('c1', {}).get('result')}"))
+    checks.append((patches.get("c2", {}).get("status") == "failed" and "caducada" in patches["c2"]["result"],
+                   "orden de hace 1 h descartada como caducada, sin tocar el proxy"))
+
     ok = True
     for passed, label in checks:
         ok &= passed

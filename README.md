@@ -93,6 +93,17 @@ actual). Solo lee los archivos de `/data` y el `/status` del proxy, y solo enví
 cambian. Usa la clave secreta de Supabase, que no sale del `.env` del VPS. Con
 `COMPOSE_PROFILES=listener,sync` en el `.env`, `docker compose up -d` lo arranca todo.
 
+## Frenos y cierre manual
+
+* `DAILY_LOSS_LIMIT_PCT`: si el equity (flotante incluido) cae ese % desde el inicio del día
+  UTC, no se abren señales nuevas hasta el día siguiente. Lo abierto se sigue gestionando.
+* `MAX_OPEN_RISK_PCT`: suma de lo que se pierde hasta el SL vigente (el de BE si ya se movió)
+  de todo lo activo, en % del equity. Una señal que lo pase se descarta.
+* Cierre manual: `POST /api/close` (`{"id"}` o `{"symbol"}`) y `POST /api/close-all`, con token.
+  Una entrada sin fill se cancela; una posición se cierra a mercado (flash close de Bitunix).
+  Sólo toca las operaciones que gestiona el bot. Desde el VPS: `./proxy close NEARUSDT` o
+  `./proxy close-all`; desde la web, los botones de TrackerProps (vía `sync.py`).
+
 ## Endpoints
 
 | Método | Ruta | Auth | Descripción |
@@ -103,6 +114,8 @@ cambian. Usa la clave secreta de Supabase, que no sale del `.env` del VPS. Con
 | `GET` | `/status` | token | equity, config, margen usado, operaciones gestionadas, contadores |
 | `GET` | `/events?after=N` | token | cola de logs, incremental por cursor |
 | `POST` | `/api/cancel` | token | `{"id": "..."}` cancela la entrada de una orden sin fill |
+| `POST` | `/api/close` | token | `{"id"}` o `{"symbol"}`: cancela la entrada o cierra la posición a mercado |
+| `POST` | `/api/close-all` | token | cierra todas las operaciones que gestiona el bot |
 
 Auth (si `WEBHOOK_TOKEN` está definido): header `X-Webhook-Token`, header `X-Token`,
 `Authorization: Bearer ...`, `?token=...` o la ruta. Con `WEBHOOK_KEYWORD` además exige esa
@@ -227,6 +240,7 @@ python3 test_monitor.py    # ciclo de vida completo contra un exchange simulado
 python3 test_paper.py      # modo paper: fills, mechas, TP, BE, SL conservador, journal en R
 python3 test_classify.py   # tipos de mensaje del canal
 python3 test_sync.py       # filas que se mandan a Supabase
+python3 test_guards.py     # freno diario, tope de riesgo abierto y cierres manuales
 bash test_webhook.sh       # levanta el servidor en DRY_RUN y dispara 5 requests
 ./proxy parse signals/sample.txt
 ./proxy status
