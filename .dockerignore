@@ -11,3 +11,4 @@ proxy_state.json
 paper_state.json
 paper_trades.jsonl
 tg_messages.jsonl
+runtime.json

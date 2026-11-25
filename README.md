@@ -99,6 +99,10 @@ cambian. Usa la clave secreta de Supabase, que no sale del `.env` del VPS. Con
   UTC, no se abren señales nuevas hasta el día siguiente. Lo abierto se sigue gestionando.
 * `MAX_OPEN_RISK_PCT`: suma de lo que se pierde hasta el SL vigente (el de BE si ya se movió)
   de todo lo activo, en % del equity. Una señal que lo pase se descarta.
+* Los dos frenos se cambian en caliente con `POST /api/guards`
+  (`{"daily_loss_limit_pct": 2, "max_open_risk_pct": 3}`, 0 = desactivado) o desde la web.
+  El valor se guarda en `RUNTIME_FILE` y manda sobre el `.env` en los reinicios. Quitar o subir
+  el freno diario levanta el de hoy; bajarlo por debajo de lo ya perdido lo activa en el acto.
 * Cierre manual: `POST /api/close` (`{"id"}` o `{"symbol"}`) y `POST /api/close-all`, con token.
   Una entrada sin fill se cancela; una posición se cierra a mercado (flash close de Bitunix).
   Sólo toca las operaciones que gestiona el bot. Desde el VPS: `./proxy close NEARUSDT` o
@@ -116,6 +120,7 @@ cambian. Usa la clave secreta de Supabase, que no sale del `.env` del VPS. Con
 | `POST` | `/api/cancel` | token | `{"id": "..."}` cancela la entrada de una orden sin fill |
 | `POST` | `/api/close` | token | `{"id"}` o `{"symbol"}`: cancela la entrada o cierra la posición a mercado |
 | `POST` | `/api/close-all` | token | cierra todas las operaciones que gestiona el bot |
+| `POST` | `/api/guards` | token | cambia el freno diario y el tope de riesgo abierto (0 = off) |
 
 Auth (si `WEBHOOK_TOKEN` está definido): header `X-Webhook-Token`, header `X-Token`,
 `Authorization: Bearer ...`, `?token=...` o la ruta. Con `WEBHOOK_KEYWORD` además exige esa

@@ -11,3 +11,4 @@ tg_messages.jsonl
 *.session
 *.session-journal
 data/
+runtime.json

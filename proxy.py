@@ -943,6 +943,24 @@ if CFG.broker == "paper":
 PAPER = CFG.broker == "paper"
 START_TS = time.time()
 
+# Frenos cambiados en caliente (desde la web o /api/guards). Viven en un archivo aparte para
+# sobrevivir a reinicios y mandan sobre el .env mientras existan.
+GUARD_KEYS = {"daily_loss_limit_pct": (0.0, 20.0), "max_open_risk_pct": (0.0, 50.0)}
+RUNTIME_PATH = _local(s("RUNTIME_FILE", "runtime.json"))
+
+
+def load_runtime() -> None:
+    try:
+        saved = json.loads(RUNTIME_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    for key, (lo, hi) in GUARD_KEYS.items():
+        if isinstance(saved.get(key), (int, float)) and lo <= saved[key] <= hi:
+            setattr(CFG, key, float(saved[key]))
+
+
+load_runtime()
+
 
 # --------------------------------------------------------------------------------------
 # Plan de la operación (tamaño, precios, apalancamiento)
@@ -1147,7 +1165,7 @@ def guards_payload(equity: float | None) -> dict:
     risk = open_risk()
     return {
         "daily_loss_limit_pct": CFG.daily_loss_limit_pct, "max_open_risk_pct": CFG.max_open_risk_pct,
-        "day_start_equity": start, "halted": bool(row.get("halted")),
+        "day_start_equity": start, "halted": bool(row.get("halted")) and CFG.daily_loss_limit_pct > 0,
         "day_change_pct": round((equity - start) / start * 100, 3) if equity and start else None,
         "open_risk": round(risk, 4),
         "open_risk_pct": round(risk / equity * 100, 3) if equity else None,
@@ -1158,7 +1176,7 @@ def risk_guard(plan: dict, sig: Signal) -> str | None:
     """Motivo para no abrir la señal (freno diario o tope de riesgo abierto), o None."""
     equity = float(plan.get("equity") or 0)
     note_day_equity(equity)
-    if STATE.daily.get(day_key(), {}).get("halted"):
+    if CFG.daily_loss_limit_pct > 0 and STATE.daily.get(day_key(), {}).get("halted"):
         return f"freno diario activo (pérdida del día ≥ {CFG.daily_loss_limit_pct:g}% del equity)"
     if CFG.max_open_risk_pct > 0 and equity > 0:
         new = abs(float(plan["entry"]) - float(plan["sl"])) * float(plan["qty"])
@@ -1880,6 +1898,45 @@ def cancel_action(payload: dict) -> tuple[int, dict]:
     return 404, {"ok": False, "error": f"{wanted} no está entre las operaciones activas"}
 
 
+def guards_action(payload: dict, origin: str = "api") -> tuple[int, dict]:
+    """Cambia en caliente el freno diario y/o el tope de riesgo abierto (0 = desactivado)."""
+    changes: dict[str, float] = {}
+    for key, (lo, hi) in GUARD_KEYS.items():
+        if key not in payload:
+            continue
+        try:
+            value = round(float(payload[key]), 2)
+        except (TypeError, ValueError):
+            return 400, {"ok": False, "error": f"{key} debe ser un número"}
+        if not lo <= value <= hi:
+            return 400, {"ok": False, "error": f"{key} debe estar entre {lo:g} y {hi:g} (0 = desactivado)"}
+        changes[key] = value
+    if not changes:
+        return 400, {"ok": False, "error": "nada que cambiar"}
+    before = {k: getattr(CFG, k) for k in GUARD_KEYS}
+    for key, value in changes.items():
+        setattr(CFG, key, value)
+    saved = {k: getattr(CFG, k) for k in GUARD_KEYS}
+    tmp = RUNTIME_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(saved), encoding="utf-8")
+    tmp.replace(RUNTIME_PATH)
+    if "daily_loss_limit_pct" in changes:
+        # Se reevalúa el día con el límite nuevo: quitarlo o subirlo levanta el freno de hoy;
+        # ponerlo por debajo de lo que ya se ha perdido lo activa en el acto.
+        with STATE.lock:
+            STATE.daily.get(day_key(), {}).pop("halted", None)
+        STATE.save()
+        equity, _, error = account_snapshot()
+        if error is None:
+            note_day_equity(equity)
+    txt = lambda v: f"{v:g}%" if v else "off"
+    log("WARNING", f"frenos cambiados ({origin}): freno diario {txt(before['daily_loss_limit_pct'])} -> "
+                   f"{txt(CFG.daily_loss_limit_pct)} · riesgo abierto {txt(before['max_open_risk_pct'])} -> "
+                   f"{txt(CFG.max_open_risk_pct)}")
+    equity, _, _ = account_snapshot()
+    return 200, {"ok": True, **saved, "guards": guards_payload(equity)}
+
+
 def close_one(rec: dict, origin: str) -> dict:
     """Cierra una operación gestionada: cancela la entrada si no se llenó, o cierra la posición a mercado."""
     symbol = rec["symbol"]
@@ -1935,6 +1992,16 @@ def http_dispatch(method: str, path: str, headers: dict, query: dict, body: str,
             except json.JSONDecodeError:
                 return 400, {"ok": False, "error": "body json inválido"}, "application/json"
             status, reply = cancel_action(payload if isinstance(payload, dict) else {})
+            return status, reply, "application/json"
+        if path == "/api/guards":
+            if not authorize(None, headers, query, body):
+                return 401, {"ok": False, "error": "no autorizado"}, "application/json"
+            try:
+                payload = json.loads(body or "{}")
+            except json.JSONDecodeError:
+                return 400, {"ok": False, "error": "body json inválido"}, "application/json"
+            payload = payload if isinstance(payload, dict) else {}
+            status, reply = guards_action(payload, origin=str(payload.get("origin") or "api")[:20])
             return status, reply, "application/json"
         if path in ("/api/close", "/api/close-all"):
             if not authorize(None, headers, query, body):
